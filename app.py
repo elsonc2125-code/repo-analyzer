@@ -246,7 +246,7 @@ def search():
     goal = request.form.get("goal", "").strip()
     language = request.form.get("language", "").strip()
     min_stars = request.form.get("min_stars", "0").strip() or "0"
-    max_results = request.form.get("max_results", "20").strip() or "20"
+    max_results = request.form.get("max_results", "5").strip() or "5"
 
     if not query:
         return jsonify({"error": "Search query is required."}), 400
@@ -278,7 +278,7 @@ def search():
 
     results = []
     if items:
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [executor.submit(process_repo, item, goal, query) for item in items]
             for f in futures:
                 try: results.append(f.result())
