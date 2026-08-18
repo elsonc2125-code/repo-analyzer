@@ -13,21 +13,15 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify, Response
 import requests
 import markdown
-import anthropic
+from google import genai
 
 app = Flask(__name__)
 DB_FILE = "database.db"
 _analysis_cache = {}
 
-# Claude API config (cheapest current tier - Haiku 4.5)
-ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-_anthropic_client = None
-
-def get_anthropic_client():
-    global _anthropic_client
-    if _anthropic_client is None:
-        _anthropic_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-    return _anthropic_client
+# Gemini API config
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # ==========================================
 # Database Setup
@@ -154,27 +148,25 @@ Respond ONLY with valid JSON in this exact structure:
   "recommendation": "Short 1-sentence verdict on whether they should use it"
 }}"""
 
-    # Claude Haiku 4.5 - cheapest current tier, good enough for structured evaluation
     try:
-        client = get_anthropic_client()
-        message = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=600,
-            system="You are a software engineer evaluating GitHub repositories. Output raw JSON only. Do not include markdown codeblocks or conversational filler.",
-            messages=[{"role": "user", "content": prompt}]
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "system_instruction": "You are a software engineer evaluating GitHub repositories. Output raw JSON only. Do not include markdown codeblocks or conversational filler."
+            }
         )
-        raw_content = message.content[0].text.strip()
-        cleaned_content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content).strip()
-        parsed = json.loads(cleaned_content)
+        parsed = json.loads(response.text)
         _analysis_cache[cache_key] = parsed
         return parsed
     except Exception as e:
-        print(f"Claude API failed: {e}")
+        print(f"Gemini API failed: {e}")
 
     # Fallback if the API call fails (missing/invalid key, network issue, bad JSON, etc.)
     fallback_result = {
         "goal_match_score": 0,
-        "match_summary": "AI analysis failed. Check that ANTHROPIC_API_KEY is set correctly.",
+        "match_summary": "AI analysis failed. Check that GEMINI_API_KEY is set correctly.",
         "key_features": [],
         "tech_stack": [],
         "setup_difficulty": "Unknown",
@@ -224,8 +216,7 @@ def process_repo(item, goal, query):
     except Exception:
         last_updated = item.get("updated_at", "")
 
-    # Composite scoring: blend Claude's qualitative goal-match with deterministic GitHub signals.
-    # This stops a repo that "reads well" but is abandoned from outscoring an actively maintained one.
+    # Composite scoring: blend Gemini's qualitative goal-match with deterministic GitHub signals.
     goal_score = analysis.get("goal_match_score", analysis.get("relevance_score", 0)) or 0
     maintenance_score = compute_maintenance_score(item)
     community_score = compute_community_score(item)
