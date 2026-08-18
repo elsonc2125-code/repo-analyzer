@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify, Response
 import requests
 import markdown
-from google import genai
+import google.generativeai as genai
 
 app = Flask(__name__)
 DB_FILE = "database.db"
@@ -21,7 +21,11 @@ _analysis_cache = {}
 
 # Gemini API config
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    model = None
 
 # ==========================================
 # Database Setup
@@ -149,13 +153,9 @@ Respond ONLY with valid JSON in this exact structure:
 }}"""
 
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash-latest",
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "system_instruction": "You are a software engineer evaluating GitHub repositories. Output raw JSON only. Do not include markdown codeblocks or conversational filler."
-            }
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
         )
         parsed = json.loads(response.text)
         _analysis_cache[cache_key] = parsed
@@ -163,7 +163,7 @@ Respond ONLY with valid JSON in this exact structure:
     except Exception as e:
         print(f"Gemini API failed: {e}")
 
-    # Fallback if the API call fails (missing/invalid key, network issue, bad JSON, etc.)
+    # Fallback if the API call fails
     fallback_result = {
         "goal_match_score": 0,
         "match_summary": "AI analysis failed. Check that GEMINI_API_KEY is set correctly.",
@@ -178,27 +178,20 @@ Respond ONLY with valid JSON in this exact structure:
     return fallback_result
 
 def compute_maintenance_score(item):
-    """0-10 score based on how recently the repo was pushed to. Deterministic, no LLM guessing."""
     pushed_at = item.get("pushed_at") or item.get("updated_at")
     try:
         pushed_dt = datetime.strptime(pushed_at, "%Y-%m-%dT%H:%M:%SZ")
         days = (datetime.utcnow() - pushed_dt).days
     except Exception:
         return 0
-    if days <= 30:
-        return 10
-    if days <= 90:
-        return 8
-    if days <= 180:
-        return 6
-    if days <= 365:
-        return 4
-    if days <= 730:
-        return 2
+    if days <= 30: return 10
+    if days <= 90: return 8
+    if days <= 180: return 6
+    if days <= 365: return 4
+    if days <= 730: return 2
     return 0
 
 def compute_community_score(item):
-    """0-10 score on a log scale of stars+forks, so 50k-star repos don't just max out identically to 500-star ones."""
     import math
     stars = item.get("stargazers_count", 0) or 0
     forks = item.get("forks_count", 0) or 0
@@ -216,7 +209,6 @@ def process_repo(item, goal, query):
     except Exception:
         last_updated = item.get("updated_at", "")
 
-    # Composite scoring: blend Gemini's qualitative goal-match with deterministic GitHub signals.
     goal_score = analysis.get("goal_match_score", analysis.get("relevance_score", 0)) or 0
     maintenance_score = compute_maintenance_score(item)
     community_score = compute_community_score(item)
@@ -225,7 +217,7 @@ def process_repo(item, goal, query):
     analysis["goal_match_score"] = goal_score
     analysis["maintenance_score"] = maintenance_score
     analysis["community_score"] = community_score
-    analysis["relevance_score"] = composite_score  # used for sorting/badge, kept for frontend compatibility
+    analysis["relevance_score"] = composite_score
 
     return {
         "full_name": item["full_name"],
@@ -246,7 +238,7 @@ def index():
     try:
         return render_template("index.html")
     except Exception:
-        return "<h1>Flask is running!</h1><p>Your file was chopped in half, but I fixed the startup.</p>"
+        return "<h1>Flask is running!</h1>"
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -259,21 +251,15 @@ def search():
     if not query:
         return jsonify({"error": "Search query is required."}), 400
 
-    try:
-        min_stars_int = int(min_stars)
-    except ValueError:
-        min_stars_int = 0
+    try: min_stars_int = int(min_stars)
+    except ValueError: min_stars_int = 0
 
-    try:
-        max_results_int = min(int(max_results), 30)
-    except ValueError:
-        max_results_int = 20
+    try: max_results_int = min(int(max_results), 30)
+    except ValueError: max_results_int = 20
 
     gh_query_parts = [query]
-    if language:
-        gh_query_parts.append(f"language:{language}")
-    if min_stars_int > 0:
-        gh_query_parts.append(f"stars:>={min_stars_int}")
+    if language: gh_query_parts.append(f"language:{language}")
+    if min_stars_int > 0: gh_query_parts.append(f"stars:>={min_stars_int}")
     gh_query = " ".join(gh_query_parts)
 
     try:
@@ -295,14 +281,11 @@ def search():
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(process_repo, item, goal, query) for item in items]
             for f in futures:
-                try:
-                    results.append(f.result())
-                except Exception as e:
-                    print(f"Failed to process repo: {e}")
+                try: results.append(f.result())
+                except Exception as e: print(f"Failed to process repo: {e}")
 
     results.sort(key=lambda r: r["analysis"].get("relevance_score", 0), reverse=True)
 
-    # Save search history
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -321,10 +304,8 @@ def search():
 @app.route("/compare", methods=["POST"])
 def compare():
     repos_data = request.form.get("repos_data", "[]")
-    try:
-        repos = json.loads(repos_data)
-    except json.JSONDecodeError:
-        repos = []
+    try: repos = json.loads(repos_data)
+    except json.JSONDecodeError: repos = []
     return render_template("compare.html", repos=repos)
 
 @app.route("/export", methods=["POST"])
@@ -339,43 +320,28 @@ def export():
     for repo in results:
         analysis = repo.get("analysis", {})
         writer.writerow([
-            repo.get("full_name", ""),
-            repo.get("url", ""),
-            repo.get("stars", ""),
-            analysis.get("relevance_score", ""),
-            analysis.get("setup_difficulty", ""),
-            ", ".join(analysis.get("tech_stack", []) or []),
-            repo.get("last_updated", ""),
-            analysis.get("match_summary", ""),
-            analysis.get("recommendation", "")
+            repo.get("full_name", ""), repo.get("url", ""), repo.get("stars", ""),
+            analysis.get("relevance_score", ""), analysis.get("setup_difficulty", ""),
+            ", ".join(analysis.get("tech_stack", []) or []), repo.get("last_updated", ""),
+            analysis.get("match_summary", ""), analysis.get("recommendation", "")
         ])
-
     csv_data = output.getvalue()
     output.close()
-
-    return Response(
-        csv_data,
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=github_repos_analysis.csv"}
-    )
+    return Response(csv_data, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=github_repos_analysis.csv"})
 
 @app.route("/api/bookmarks", methods=["GET", "POST"])
 def bookmarks():
     conn = get_db()
     cursor = conn.cursor()
-
     if request.method == "GET":
         cursor.execute("SELECT * FROM bookmarks ORDER BY created_at DESC")
         rows = [dict(row) for row in cursor.fetchall()]
         for row in rows:
-            try:
-                row["tech_stack"] = json.loads(row["tech_stack"]) if row["tech_stack"] else []
-            except (TypeError, json.JSONDecodeError):
-                row["tech_stack"] = []
+            try: row["tech_stack"] = json.loads(row["tech_stack"]) if row["tech_stack"] else []
+            except (TypeError, json.JSONDecodeError): row["tech_stack"] = []
         conn.close()
         return jsonify(rows)
 
-    # POST
     data = request.get_json(silent=True) or {}
     full_name = data.get("full_name")
     if not full_name:
@@ -386,16 +352,9 @@ def bookmarks():
         cursor.execute(
             """INSERT INTO bookmarks (repo_full_name, stars, relevance_score, summary, tech_stack,
                setup_difficulty, notes, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                full_name,
-                data.get("stars", 0),
-                data.get("relevance_score", 0),
-                data.get("summary", ""),
-                json.dumps(data.get("tech_stack", [])),
-                data.get("setup_difficulty", ""),
-                data.get("notes", ""),
-                data.get("url", "")
-            )
+            (full_name, data.get("stars", 0), data.get("relevance_score", 0), data.get("summary", ""),
+             json.dumps(data.get("tech_stack", [])), data.get("setup_difficulty", ""),
+             data.get("notes", ""), data.get("url", ""))
         )
         conn.commit()
         conn.close()
@@ -408,7 +367,6 @@ def bookmarks():
 def update_bookmark_notes(full_name):
     data = request.get_json(silent=True) or {}
     notes = data.get("notes", "")
-
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("UPDATE bookmarks SET notes = ? WHERE repo_full_name = ?", (notes, full_name))
@@ -439,12 +397,9 @@ def history():
 # ==========================================
 
 if __name__ == "__main__":
-    # Local dev only. In production (Render), gunicorn imports the `app` object directly
-    # via the Procfile and never executes this block.
     port = int(os.environ.get("PORT", 5000))
     url = f"http://127.0.0.1:{port}/"
 
-    # Open Brave (or default browser) after Flask boots
     def open_browser():
         try:
             brave_paths = [
