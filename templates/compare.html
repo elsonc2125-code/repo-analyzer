@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Compare Repositories</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card-bg: #1e293b;
+            --border: #334155;
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --accent: #10b981;
+            --danger: #ef4444;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        body { background-color: var(--bg); color: var(--text); padding: 24px; }
+        h1 { margin-bottom: 20px; }
+        .matrix-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        .matrix-table th, .matrix-table td { border: 1px solid var(--border); padding: 16px; vertical-align: top; background: var(--card-bg); }
+        .matrix-table th { background: #182232; width: 180px; text-align: left; color: var(--text-muted); }
+        .repo-header { font-size: 1.1rem; font-weight: bold; }
+        .score { display: inline-block; padding: 4px 8px; border-radius: 4px; font-weight: bold; background: rgba(16, 185, 129, 0.2); color: #34d399; margin-top: 6px; }
+        .tag { display: inline-block; background: #334155; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; margin-right: 4px; margin-bottom: 4px; }
+        ul { margin-left: 18px; font-size: 0.9rem; }
+        li { margin-bottom: 4px; }
+    </style>
+</head>
+<body>
+    <h1>Side-by-Side Comparison</h1>
+    <a href="/" style="color: var(--primary); text-decoration: none;">← Back to Search</a>
+
+    <table class="matrix-table">
+        <tbody>
+            <tr>
+                <th>Repository</th>
+                {% for repo in repos %}
+                <td>
+                    <div class="repo-header"><a href="{{ repo.url }}" target="_blank" style="color: var(--primary);">{{ repo.full_name }}</a></div>
+                    <div style="font-size: 0.85rem; color: var(--text-muted);">★ {{ repo.stars }} | Updated: {{ repo.last_updated }}</div>
+                </td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Relevance Score</th>
+                {% for repo in repos %}
+                <td>
+                    <div class="score">{{ repo.analysis.relevance_score }}/10</div>
+                </td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Goal Match</th>
+                {% for repo in repos %}
+                <td>{{ repo.analysis.match_summary }}</td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Tech Stack</th>
+                {% for repo in repos %}
+                <td>
+                    {% for tag in repo.analysis.tech_stack %}
+                    <span class="tag">{{ tag }}</span>
+                    {% endfor %}
+                </td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Setup Difficulty</th>
+                {% for repo in repos %}
+                <td><strong>{{ repo.analysis.setup_difficulty }}</strong></td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Pros</th>
+                {% for repo in repos %}
+                <td>
+                    <ul style="color: #34d399;">
+                        {% for pro in repo.analysis.pros %}
+                        <li>{{ pro }}</li>
+                        {% endfor %}
+                    </ul>
+                </td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Cons</th>
+                {% for repo in repos %}
+                <td>
+                    <ul style="color: #f87171;">
+                        {% for con in repo.analysis.cons %}
+                        <li>{{ con }}</li>
+                        {% endfor %}
+                    </ul>
+                </td>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th>Recommendation</th>
+                {% for repo in repos %}
+                <td style="font-size: 0.9rem;">{{ repo.analysis.recommendation }}</td>
+                {% endfor %}
+            </tr>
+        </tbody>
+    </table>
+</body>
+</html>
