@@ -81,8 +81,8 @@ th { background: #182232; font-size: 0.8rem; color: var(--text-muted); text-tran
 <div class="form-group">
 <label>Max Results</label>
 <select name="max_results">
-<option value="3">3 repos</option>
-<option value="5" selected>5 repos</option>
+<option value="3" selected>3 repos</option>
+<option value="5">5 repos</option>
 <option value="10">10 repos</option>
 </select>
 </div>
@@ -191,7 +191,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-const SECONDS_PER_REPO = 9; // calibrate this later if it's consistently off
+const SECONDS_PER_REPO = 16; // bumped up for Phase 2: each repo now fetches file tree, dependency files, and metadata
 const originalTitle = document.title;
 let titleFlashInterval = null;
 
