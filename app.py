@@ -151,7 +151,151 @@ def fetch_readme(owner, repo):
     return "No README available or repository is private."
 
 
-def analyze_with_llm(repo_name, description, readme_text, user_goal, query):
+# Files worth inspecting for tech stack, dependencies, and setup complexity.
+# Kept short and specific so we don't spam the GitHub API per repo.
+DEPENDENCY_FILES = [
+    "requirements.txt", "package.json", "pyproject.toml", "Pipfile",
+    "Dockerfile", "docker-compose.yml", ".env.example", "setup.py"
+]
+
+
+def fetch_file_tree(owner, repo, default_branch):
+    """Return a flat list of file paths in the repo (top-level tree, non-recursive
+    truncation risk is acceptable here since we only match against known filenames)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}"
+    try:
+        resp = requests.get(url, headers=get_github_headers(),
+                             params={"recursive": "1"}, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch file tree for {owner}/{repo}: {e}")
+        return []
+
+    if resp.status_code != 200:
+        return []
+
+    tree = resp.json().get("tree", [])
+    return [item["path"] for item in tree if item.get("type") == "blob"]
+
+
+def fetch_file_content(owner, repo, path, max_chars=2000):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    try:
+        resp = requests.get(url, headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch {path} for {owner}/{repo}: {e}")
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json()
+    if data.get("encoding") != "base64":
+        return None
+
+    try:
+        content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    return content[:max_chars]
+
+
+def fetch_dependency_files(owner, repo, file_paths):
+    """Given the repo's file tree, fetch the contents of any recognized
+    dependency/config files found at the repo root."""
+    found = {}
+    root_files = {p for p in file_paths if "/" not in p}
+    for fname in DEPENDENCY_FILES:
+        if fname in root_files:
+            content = fetch_file_content(owner, repo, fname)
+            if content:
+                found[fname] = content
+    return found
+
+
+def fetch_repo_metadata(owner, repo):
+    """Pull license, contributor count, open issue count, and latest release.
+    Each call is independent and best-effort: a failure in one shouldn't block
+    the others or crash the whole analysis."""
+    metadata = {
+        "license": None,
+        "contributor_count": None,
+        "open_issues": None,
+        "latest_release": None,
+        "latest_release_date": None,
+    }
+
+    try:
+        resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}",
+                             headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            data = resp.json()
+            license_info = data.get("license") or {}
+            metadata["license"] = license_info.get("spdx_id") or license_info.get("name")
+            metadata["open_issues"] = data.get("open_issues_count")
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch repo metadata for {owner}/{repo}: {e}")
+
+    try:
+        resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}/contributors",
+                             headers=get_github_headers(), params={"per_page": 1, "anon": "true"},
+                             timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            # GitHub returns pagination info in the Link header; last page number
+            # approximates total contributor count without fetching every page.
+            link_header = resp.headers.get("Link", "")
+            match = re.search(r'page=(\d+)>; rel="last"', link_header)
+            if match:
+                metadata["contributor_count"] = int(match.group(1))
+            else:
+                metadata["contributor_count"] = len(resp.json())
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch contributors for {owner}/{repo}: {e}")
+
+    try:
+        resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}/releases/latest",
+                             headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            data = resp.json()
+            metadata["latest_release"] = data.get("tag_name")
+            metadata["latest_release_date"] = data.get("published_at")
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch latest release for {owner}/{repo}: {e}")
+
+    return metadata
+
+
+def build_repo_snapshot(readme_text, dependency_files, metadata):
+    """Turn raw dependency file contents + metadata into a compact, structured
+    text block for the AI prompt. Keeps each file short so the whole snapshot
+    stays within a reasonable prompt size even for repos with several files."""
+    lines = []
+
+    lines.append("--- GITHUB METADATA ---")
+    lines.append(f"License: {metadata.get('license') or 'None detected'}")
+    lines.append(f"Contributors: {metadata.get('contributor_count') if metadata.get('contributor_count') is not None else 'Unknown'}")
+    lines.append(f"Open issues: {metadata.get('open_issues') if metadata.get('open_issues') is not None else 'Unknown'}")
+    if metadata.get("latest_release"):
+        lines.append(f"Latest release: {metadata['latest_release']} ({metadata.get('latest_release_date', 'date unknown')})")
+    else:
+        lines.append("Latest release: None found")
+
+    if dependency_files:
+        lines.append("\n--- DEPENDENCY / CONFIG FILES FOUND ---")
+        for fname, content in dependency_files.items():
+            lines.append(f"\n[{fname}]")
+            lines.append(content[:1200])
+    else:
+        lines.append("\n--- DEPENDENCY / CONFIG FILES FOUND ---")
+        lines.append("None detected (no requirements.txt, package.json, pyproject.toml, Dockerfile, etc. at repo root).")
+
+    lines.append("\n--- README (truncated) ---")
+    lines.append(readme_text[:3000])
+
+    return "\n".join(lines)
+
+
+def analyze_with_llm(repo_name, description, snapshot, user_goal, query):
     cache_key = get_cache_key(repo_name, user_goal)
     if cache_key in _analysis_cache:
         return _analysis_cache[cache_key]
@@ -166,7 +310,9 @@ def analyze_with_llm(repo_name, description, readme_text, user_goal, query):
             "setup_difficulty": "Unknown",
             "pros": [],
             "cons": [],
-            "recommendation": "Set GEMINI_API_KEY on the server and try again."
+            "recommendation": "Set GEMINI_API_KEY on the server and try again.",
+            "use_if": "",
+            "avoid_if": ""
         }
         _analysis_cache[cache_key] = fallback_result
         return fallback_result
@@ -174,24 +320,33 @@ def analyze_with_llm(repo_name, description, readme_text, user_goal, query):
     terms = extract_goal_terms(user_goal, query)
     key_terms = ", ".join(terms['file_terms'][:12])
 
-    prompt = f"""Evaluate this GitHub repository against the user's goal.
+    prompt = f"""Evaluate this GitHub repository against the user's goal. You are looking at
+more than just the README: you also have the repository's actual dependency
+files, license, contributor count, issue count, and release history. Use ALL
+of this to judge whether the repo is genuinely a good fit, not just whether
+its description sounds relevant. A repo with a great README but no releases,
+no dependency files, and one contributor should be treated with more caution
+than the summary alone would suggest.
+
 User Goal: "{user_goal}"
 Key terms of interest: {key_terms}
 Repository Name: "{repo_name}"
 Description: "{description}"
-README Snippet:
-{readme_text[:3000]}
+
+{snapshot}
 
 Respond ONLY with valid JSON in this exact structure:
 {{
 "goal_match_score": 8,
-"match_summary": "Short explanation of why it matches or fails the goal",
+"match_summary": "Short explanation of why it matches or fails the goal, referencing concrete evidence (dependencies, license, activity) where relevant",
 "key_features": ["Feature 1", "Feature 2"],
 "tech_stack": ["Python", "Flask"],
 "setup_difficulty": "Easy",
 "pros": ["Pro 1", "Pro 2"],
 "cons": ["Con 1", "Con 2"],
-"recommendation": "Short 1-sentence verdict on whether they should use it"
+"recommendation": "Short 1-sentence verdict on whether they should use it",
+"use_if": "One short sentence: use this repo if...",
+"avoid_if": "One short sentence: avoid this repo if..."
 }}"""
 
     try:
@@ -214,26 +369,65 @@ Respond ONLY with valid JSON in this exact structure:
         "setup_difficulty": "Unknown",
         "pros": [],
         "cons": [],
-        "recommendation": "Manual review required."
+        "recommendation": "Manual review required.",
+        "use_if": "",
+        "avoid_if": ""
     }
     _analysis_cache[cache_key] = fallback_result
     return fallback_result
 
 
-def compute_maintenance_score(item):
+def compute_maintenance_score(item, metadata=None):
+    """Blends last-push recency (still the strongest signal) with release
+    recency and open-issue count so a repo that was updated once and then
+    abandoned doesn't score the same as one under active development."""
     pushed_at = item.get("pushed_at") or item.get("updated_at")
     try:
         pushed_dt = datetime.strptime(pushed_at, "%Y-%m-%dT%H:%M:%SZ")
-        days = (datetime.utcnow() - pushed_dt).days
+        days_since_push = (datetime.utcnow() - pushed_dt).days
     except Exception:
-        return 0
+        days_since_push = None
 
-    if days <= 30: return 10
-    if days <= 90: return 8
-    if days <= 180: return 6
-    if days <= 365: return 4
-    if days <= 730: return 2
-    return 0
+    if days_since_push is None:
+        push_score = 0
+    elif days_since_push <= 30: push_score = 10
+    elif days_since_push <= 90: push_score = 8
+    elif days_since_push <= 180: push_score = 6
+    elif days_since_push <= 365: push_score = 4
+    elif days_since_push <= 730: push_score = 2
+    else: push_score = 0
+
+    if not metadata:
+        return push_score
+
+    # Release recency: a repo that has never released anything, or hasn't in
+    # years, is weaker evidence of active maintenance even if commits are recent.
+    release_date = metadata.get("latest_release_date")
+    if release_date:
+        try:
+            release_dt = datetime.strptime(release_date, "%Y-%m-%dT%H:%M:%SZ")
+            days_since_release = (datetime.utcnow() - release_dt).days
+            if days_since_release <= 180: release_score = 10
+            elif days_since_release <= 365: release_score = 7
+            elif days_since_release <= 730: release_score = 4
+            else: release_score = 2
+        except Exception:
+            release_score = 3
+    else:
+        release_score = 3  # no releases at all isn't disqualifying, just weaker evidence
+
+    # Open issue count as a rough signal of unaddressed backlog. This is a blunt
+    # instrument (a popular repo naturally has more issues) so it's weighted lightly.
+    open_issues = metadata.get("open_issues")
+    if open_issues is None:
+        issue_score = 5
+    elif open_issues <= 20: issue_score = 10
+    elif open_issues <= 75: issue_score = 7
+    elif open_issues <= 200: issue_score = 5
+    else: issue_score = 3
+
+    blended = 0.6 * push_score + 0.25 * release_score + 0.15 * issue_score
+    return round(blended, 1)
 
 
 def compute_community_score(item):
@@ -247,9 +441,15 @@ def compute_community_score(item):
 def process_repo(item, goal, query):
     owner = item["owner"]["login"]
     name = item["name"]
+    default_branch = item.get("default_branch", "main")
 
     readme_text = fetch_readme(owner, name)
-    analysis = analyze_with_llm(item["full_name"], item.get("description") or "", readme_text, goal, query)
+    file_paths = fetch_file_tree(owner, name, default_branch)
+    dependency_files = fetch_dependency_files(owner, name, file_paths)
+    metadata = fetch_repo_metadata(owner, name)
+
+    snapshot = build_repo_snapshot(readme_text, dependency_files, metadata)
+    analysis = analyze_with_llm(item["full_name"], item.get("description") or "", snapshot, goal, query)
 
     try:
         last_updated = datetime.strptime(item["updated_at"], "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
@@ -257,7 +457,7 @@ def process_repo(item, goal, query):
         last_updated = item.get("updated_at", "")
 
     goal_score = analysis.get("goal_match_score", analysis.get("relevance_score", 0)) or 0
-    maintenance_score = compute_maintenance_score(item)
+    maintenance_score = compute_maintenance_score(item, metadata)
     community_score = compute_community_score(item)
     composite_score = round(0.6 * goal_score + 0.25 * maintenance_score + 0.15 * community_score, 1)
 
@@ -273,6 +473,11 @@ def process_repo(item, goal, query):
         "stars": item.get("stargazers_count", 0),
         "last_updated": last_updated,
         "readme_html": render_readme_html(readme_text),
+        "license": metadata.get("license"),
+        "contributor_count": metadata.get("contributor_count"),
+        "open_issues": metadata.get("open_issues"),
+        "latest_release": metadata.get("latest_release"),
+        "dependency_files_found": list(dependency_files.keys()),
         "analysis": analysis
     }
 
