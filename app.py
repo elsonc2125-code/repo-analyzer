@@ -6,35 +6,57 @@ import sqlite3
 import hashlib
 import io
 import csv
+import logging
 import webbrowser
 from threading import Timer
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+
 from flask import Flask, render_template, request, jsonify, Response
 import requests
 import markdown
+import bleach
 import google.generativeai as genai
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 DB_FILE = "database.db"
 _analysis_cache = {}
 
+REQUEST_TIMEOUT = 10  # seconds, for GitHub API calls
+
+# ==========================================
+# README sanitization
+# ==========================================
+ALLOWED_TAGS = ["p", "a", "code", "pre", "ul", "ol", "li", "strong", "em",
+                "h1", "h2", "h3", "br", "blockquote"]
+ALLOWED_ATTRS = {"a": ["href", "title"]}
+
+
+def render_readme_html(readme_text):
+    raw_html = markdown.markdown(readme_text, extensions=["fenced_code", "tables"])
+    return bleach.clean(raw_html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
+
+
 # Gemini API config
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-3.6-flash")
 else:
     model = None
+    logger.warning("GEMINI_API_KEY is not set. AI analysis will be unavailable.")
 
 # ==========================================
 # Database Setup
 # ==========================================
-
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-
     # Bookmarks Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bookmarks (
@@ -50,7 +72,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
     # Search History Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS search_history (
@@ -64,49 +85,48 @@ def init_db():
             searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
     conn.commit()
     conn.close()
+
 
 init_db()
 
 # ==========================================
 # Helper Functions
 # ==========================================
-
 def get_db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def get_cache_key(repo_name, goal):
     return hashlib.md5(f"{repo_name}:{goal}".encode()).hexdigest()
+
 
 def extract_goal_terms(goal, query):
     combined = f'{goal} {query}'.lower()
     words = set(re.findall(r'\b\w{3,}\b', combined))
-
     EXPAND = {
-        'control':   ['adjust', 'setting', 'param', 'config', 'option', 'customize', 'tune', 'modify'],
-        'detect':    ['recogni', 'find', 'extract', 'identify', 'discover'],
-        'convert':   ['transform', 'translat', 'map', 'turn'],
-        'generate':  ['create', 'produce', 'build', 'make', 'output'],
-        'train':     ['learn', 'fine.tune', 'finetune', 'fit'],
+        'control': ['adjust', 'setting', 'param', 'config', 'option', 'customize', 'tune', 'modify'],
+        'detect': ['recogni', 'find', 'extract', 'identify', 'discover'],
+        'convert': ['transform', 'translat', 'map', 'turn'],
+        'generate': ['create', 'produce', 'build', 'make', 'output'],
+        'train': ['learn', 'fine.tune', 'finetune', 'fit'],
         'real.time': ['realtime', 'live', 'streaming', 'online'],
-        'gui':       ['graphical', 'interface', 'tkinter', 'qt', 'gradio', 'streamlit', 'webui'],
-        'test':      ['pytest', 'unittest'],
-        'deploy':    ['docker', 'container', 'cloud'],
+        'gui': ['graphical', 'interface', 'tkinter', 'qt', 'gradio', 'streamlit', 'webui'],
+        'test': ['pytest', 'unittest'],
+        'deploy': ['docker', 'container', 'cloud'],
     }
-
     expanded = set(words)
     for w in list(words):
         for key, syns in EXPAND.items():
             all_forms = [key] + syns
             if any(w in form or form in w for form in all_forms if len(form) >= 4):
                 expanded.update(syns)
-
     file_terms = sorted([t for t in expanded if len(t) >= 3], key=len, reverse=True)
     return {'raw_words': words, 'expanded': expanded, 'file_terms': file_terms}
+
 
 def get_github_headers():
     token = os.getenv("GITHUB_TOKEN")
@@ -115,19 +135,41 @@ def get_github_headers():
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
+
 def fetch_readme(owner, repo):
     url = f"https://api.github.com/repos/{owner}/{repo}/readme"
-    resp = requests.get(url, headers=get_github_headers())
+    try:
+        resp = requests.get(url, headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch README for {owner}/{repo}: {e}")
+        return "No README available or repository is private."
+
     if resp.status_code == 200:
         data = resp.json()
         content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="ignore")
         return content[:6000]
     return "No README available or repository is private."
 
+
 def analyze_with_llm(repo_name, description, readme_text, user_goal, query):
     cache_key = get_cache_key(repo_name, user_goal)
     if cache_key in _analysis_cache:
         return _analysis_cache[cache_key]
+
+    # Handle missing Gemini key cleanly, before attempting any call
+    if model is None:
+        fallback_result = {
+            "goal_match_score": 0,
+            "match_summary": "AI analysis unavailable: GEMINI_API_KEY is not set.",
+            "key_features": [],
+            "tech_stack": [],
+            "setup_difficulty": "Unknown",
+            "pros": [],
+            "cons": [],
+            "recommendation": "Set GEMINI_API_KEY on the server and try again."
+        }
+        _analysis_cache[cache_key] = fallback_result
+        return fallback_result
 
     terms = extract_goal_terms(user_goal, query)
     key_terms = ", ".join(terms['file_terms'][:12])
@@ -142,14 +184,14 @@ README Snippet:
 
 Respond ONLY with valid JSON in this exact structure:
 {{
-  "goal_match_score": 8,
-  "match_summary": "Short explanation of why it matches or fails the goal",
-  "key_features": ["Feature 1", "Feature 2"],
-  "tech_stack": ["Python", "Flask"],
-  "setup_difficulty": "Easy",
-  "pros": ["Pro 1", "Pro 2"],
-  "cons": ["Con 1", "Con 2"],
-  "recommendation": "Short 1-sentence verdict on whether they should use it"
+"goal_match_score": 8,
+"match_summary": "Short explanation of why it matches or fails the goal",
+"key_features": ["Feature 1", "Feature 2"],
+"tech_stack": ["Python", "Flask"],
+"setup_difficulty": "Easy",
+"pros": ["Pro 1", "Pro 2"],
+"cons": ["Con 1", "Con 2"],
+"recommendation": "Short 1-sentence verdict on whether they should use it"
 }}"""
 
     try:
@@ -161,12 +203,12 @@ Respond ONLY with valid JSON in this exact structure:
         _analysis_cache[cache_key] = parsed
         return parsed
     except Exception as e:
-        print(f"Gemini API failed: {e}")
+        logger.error(f"Gemini API failed for {repo_name}: {e}")
 
     # Fallback if the API call fails
     fallback_result = {
         "goal_match_score": 0,
-        "match_summary": "AI analysis failed. Check that GEMINI_API_KEY is set correctly.",
+        "match_summary": "AI analysis failed. Please try again shortly.",
         "key_features": [],
         "tech_stack": [],
         "setup_difficulty": "Unknown",
@@ -177,6 +219,7 @@ Respond ONLY with valid JSON in this exact structure:
     _analysis_cache[cache_key] = fallback_result
     return fallback_result
 
+
 def compute_maintenance_score(item):
     pushed_at = item.get("pushed_at") or item.get("updated_at")
     try:
@@ -184,12 +227,14 @@ def compute_maintenance_score(item):
         days = (datetime.utcnow() - pushed_dt).days
     except Exception:
         return 0
+
     if days <= 30: return 10
     if days <= 90: return 8
     if days <= 180: return 6
     if days <= 365: return 4
     if days <= 730: return 2
     return 0
+
 
 def compute_community_score(item):
     import math
@@ -198,9 +243,11 @@ def compute_community_score(item):
     score = min(10, math.log10(stars + forks + 1) * 3.3)
     return round(score, 1)
 
+
 def process_repo(item, goal, query):
     owner = item["owner"]["login"]
     name = item["name"]
+
     readme_text = fetch_readme(owner, name)
     analysis = analyze_with_llm(item["full_name"], item.get("description") or "", readme_text, goal, query)
 
@@ -225,20 +272,21 @@ def process_repo(item, goal, query):
         "url": item["html_url"],
         "stars": item.get("stargazers_count", 0),
         "last_updated": last_updated,
-        "readme_html": markdown.markdown(readme_text, extensions=["fenced_code", "tables"]),
+        "readme_html": render_readme_html(readme_text),
         "analysis": analysis
     }
+
 
 # ==========================================
 # Flask Routes
 # ==========================================
-
 @app.route("/")
 def index():
     try:
         return render_template("index.html")
     except Exception:
         return "<h1>Flask is running!</h1>"
+
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -251,28 +299,41 @@ def search():
     if not query:
         return jsonify({"error": "Search query is required."}), 400
 
-    try: min_stars_int = int(min_stars)
-    except ValueError: min_stars_int = 0
+    try:
+        min_stars_int = int(min_stars)
+    except ValueError:
+        min_stars_int = 0
 
-    try: max_results_int = min(int(max_results), 30)
-    except ValueError: max_results_int = 20
+    try:
+        max_results_int = min(int(max_results), 30)
+    except ValueError:
+        max_results_int = 20
 
     gh_query_parts = [query]
-    if language: gh_query_parts.append(f"language:{language}")
-    if min_stars_int > 0: gh_query_parts.append(f"stars:>={min_stars_int}")
+    if language:
+        gh_query_parts.append(f"language:{language}")
+    if min_stars_int > 0:
+        gh_query_parts.append(f"stars:>={min_stars_int}")
     gh_query = " ".join(gh_query_parts)
 
     try:
         resp = requests.get(
             "https://api.github.com/search/repositories",
             headers=get_github_headers(),
-            params={"q": gh_query, "sort": "stars", "order": "desc", "per_page": max_results_int}
+            params={"q": gh_query, "sort": "stars", "order": "desc", "per_page": max_results_int},
+            timeout=REQUEST_TIMEOUT
         )
     except requests.RequestException as e:
-        return jsonify({"error": f"Failed to reach GitHub: {e}"}), 502
+        logger.error(f"Failed to reach GitHub search API: {e}")
+        return jsonify({"error": "Failed to reach GitHub. Please try again."}), 502
+
+    # Handle GitHub rate limiting with a friendly message
+    if resp.status_code == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
+        return jsonify({"error": "GitHub search limit reached. Please try again in a few minutes."}), 429
 
     if resp.status_code != 200:
-        return jsonify({"error": f"GitHub API error ({resp.status_code}): {resp.text[:200]}"}), resp.status_code
+        logger.error(f"GitHub API error ({resp.status_code}): {resp.text[:200]}")
+        return jsonify({"error": "GitHub API returned an error. Please try again."}), resp.status_code
 
     items = resp.json().get("items", [])[:max_results_int]
 
@@ -281,8 +342,10 @@ def search():
         with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [executor.submit(process_repo, item, goal, query) for item in items]
             for f in futures:
-                try: results.append(f.result())
-                except Exception as e: print(f"Failed to process repo: {e}")
+                try:
+                    results.append(f.result())
+                except Exception as e:
+                    logger.error(f"Failed to process repo: {e}")
 
     results.sort(key=lambda r: r["analysis"].get("relevance_score", 0), reverse=True)
 
@@ -297,16 +360,20 @@ def search():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Failed to save search history: {e}")
+        logger.error(f"Failed to save search history: {e}")
 
     return jsonify({"results": results})
+
 
 @app.route("/compare", methods=["POST"])
 def compare():
     repos_data = request.form.get("repos_data", "[]")
-    try: repos = json.loads(repos_data)
-    except json.JSONDecodeError: repos = []
+    try:
+        repos = json.loads(repos_data)
+    except json.JSONDecodeError:
+        repos = []
     return render_template("compare.html", repos=repos)
+
 
 @app.route("/export", methods=["POST"])
 def export():
@@ -327,18 +394,24 @@ def export():
         ])
     csv_data = output.getvalue()
     output.close()
-    return Response(csv_data, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=github_repos_analysis.csv"})
+
+    return Response(csv_data, mimetype="text/csv",
+                     headers={"Content-Disposition": "attachment; filename=github_repos_analysis.csv"})
+
 
 @app.route("/api/bookmarks", methods=["GET", "POST"])
 def bookmarks():
     conn = get_db()
     cursor = conn.cursor()
+
     if request.method == "GET":
         cursor.execute("SELECT * FROM bookmarks ORDER BY created_at DESC")
         rows = [dict(row) for row in cursor.fetchall()]
         for row in rows:
-            try: row["tech_stack"] = json.loads(row["tech_stack"]) if row["tech_stack"] else []
-            except (TypeError, json.JSONDecodeError): row["tech_stack"] = []
+            try:
+                row["tech_stack"] = json.loads(row["tech_stack"]) if row["tech_stack"] else []
+            except (TypeError, json.JSONDecodeError):
+                row["tech_stack"] = []
         conn.close()
         return jsonify(rows)
 
@@ -363,6 +436,7 @@ def bookmarks():
         conn.close()
         return jsonify({"error": "Repository is already bookmarked."}), 409
 
+
 @app.route("/api/bookmarks/<path:full_name>/notes", methods=["PUT"])
 def update_bookmark_notes(full_name):
     data = request.get_json(silent=True) or {}
@@ -374,6 +448,7 @@ def update_bookmark_notes(full_name):
     conn.close()
     return jsonify({"status": "updated"})
 
+
 @app.route("/api/bookmarks/<path:full_name>", methods=["DELETE"])
 def delete_bookmark(full_name):
     conn = get_db()
@@ -382,6 +457,7 @@ def delete_bookmark(full_name):
     conn.commit()
     conn.close()
     return jsonify({"status": "deleted"})
+
 
 @app.route("/api/history", methods=["GET"])
 def history():
@@ -392,10 +468,19 @@ def history():
     conn.close()
     return jsonify(rows)
 
+
+# ==========================================
+# Global error handler: never leak raw exceptions to the client
+# ==========================================
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    logger.error(f"Unhandled exception: {e}")
+    return jsonify({"error": "Something went wrong. Please try again."}), 500
+
+
 # ==========================================
 # Main Execution
 # ==========================================
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     url = f"http://127.0.0.1:{port}/"
