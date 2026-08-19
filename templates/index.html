@@ -88,6 +88,10 @@ th { background: #182232; font-size: 0.8rem; color: var(--text-muted); text-tran
 </div>
 <button type="submit" class="btn-primary">Scan Repos</button>
 </form>
+<label style="display:flex; align-items:center; gap:6px; margin-top:10px; font-size:0.8rem; color:var(--text-muted); cursor:pointer;">
+<input type="checkbox" id="notify-checkbox" style="width:auto;">
+🔔 Notify me when the scan finishes
+</label>
 </div>
 
 <!-- History Bar -->
@@ -188,6 +192,47 @@ function escapeHtml(str) {
 }
 
 const SECONDS_PER_REPO = 9; // calibrate this later if it's consistently off
+const originalTitle = document.title;
+let titleFlashInterval = null;
+
+// Ask for notification permission as soon as the user opts in, not at page load,
+// so the browser prompt only appears in response to a clear user action.
+document.getElementById('notify-checkbox').addEventListener('change', (e) => {
+  if (e.target.checked && 'Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+});
+
+function stopTitleFlash() {
+  if (titleFlashInterval) {
+    clearInterval(titleFlashInterval);
+    titleFlashInterval = null;
+    document.title = originalTitle;
+  }
+}
+
+function notifyScanComplete(resultCount) {
+  const wantsNotification = document.getElementById('notify-checkbox').checked;
+  if (!wantsNotification) return;
+
+  const message = `Scan complete — ${resultCount} repositories analyzed.`;
+
+  // Preferred: native browser notification, works even if the tab isn't focused
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification('GitHub Repo Analyzer', { body: message });
+    return;
+  }
+
+  // Fallback: flash the tab title until the user comes back to the tab
+  let flashOn = false;
+  stopTitleFlash();
+  titleFlashInterval = setInterval(() => {
+    document.title = flashOn ? originalTitle : '✅ Scan complete!';
+    flashOn = !flashOn;
+  }, 1000);
+
+  window.addEventListener('focus', stopTitleFlash, { once: true });
+}
 
 document.getElementById('search-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -195,6 +240,7 @@ document.getElementById('search-form').addEventListener('submit', async (e) => {
   const maxResults = parseInt(formData.get('max_results')) || 5;
   const estimatedSeconds = maxResults * SECONDS_PER_REPO;
 
+  stopTitleFlash();
   document.getElementById('loading').style.display = 'block';
   document.getElementById('results-section').style.display = 'none';
   document.getElementById('progress-bar').style.width = '5%';
@@ -235,6 +281,7 @@ document.getElementById('search-form').addEventListener('submit', async (e) => {
       currentResults = data.results;
       renderResults(data.results);
       loadHistory();
+      notifyScanComplete(data.results.length);
     } else {
       alert('Error: ' + (data.error || 'Failed to fetch repositories'));
     }
