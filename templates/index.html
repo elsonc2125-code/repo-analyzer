@@ -104,6 +104,7 @@ th { background: #182232; font-size: 0.8rem; color: var(--text-muted); text-tran
 <div id="progress-bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); border-radius: 4px; transition: width 0.3s ease;"></div>
 </div>
 <div id="progress-text" style="color: var(--text-muted); font-size: 0.9rem;">Initializing search...</div>
+<div id="progress-eta" style="color: var(--text-muted); font-size: 0.8rem; margin-top: 6px;"></div>
 </div>
 
 <!-- Results Section -->
@@ -186,23 +187,49 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+const SECONDS_PER_REPO = 9; // calibrate this later if it's consistently off
+
 document.getElementById('search-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
+  const maxResults = parseInt(formData.get('max_results')) || 5;
+  const estimatedSeconds = maxResults * SECONDS_PER_REPO;
+
   document.getElementById('loading').style.display = 'block';
   document.getElementById('results-section').style.display = 'none';
-  document.getElementById('progress-bar').style.width = '15%';
+  document.getElementById('progress-bar').style.width = '5%';
   document.getElementById('progress-text').innerText = 'Querying GitHub API...';
 
-  try {
-    setTimeout(() => {
-      document.getElementById('progress-bar').style.width = '45%';
-      document.getElementById('progress-text').innerText = 'Downloading READMEs & running AI evaluation...';
-    }, 400);
+  const startTime = Date.now();
+  let progressInterval;
 
+  function updateProgress() {
+    const elapsed = (Date.now() - startTime) / 1000;
+    const remaining = Math.max(0, Math.ceil(estimatedSeconds - elapsed));
+    // Cap displayed progress at 90% until the real response arrives
+    const pct = Math.min(90, (elapsed / estimatedSeconds) * 90);
+    document.getElementById('progress-bar').style.width = pct + '%';
+
+    if (elapsed < 1.5) {
+      document.getElementById('progress-text').innerText = 'Querying GitHub API...';
+    } else {
+      document.getElementById('progress-text').innerText = `Analyzing repositories (${maxResults} total)...`;
+    }
+
+    document.getElementById('progress-eta').innerText =
+      remaining > 0 ? `Estimated time remaining: ~${remaining}s` : 'Almost done...';
+  }
+
+  updateProgress();
+  progressInterval = setInterval(updateProgress, 500);
+
+  try {
     const response = await fetch('/search', { method: 'POST', body: formData });
     const data = await response.json();
-    document.getElementById('progress-bar').style.width = '90%';
+
+    clearInterval(progressInterval);
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('progress-eta').innerText = '';
 
     if (response.ok) {
       currentResults = data.results;
@@ -212,9 +239,9 @@ document.getElementById('search-form').addEventListener('submit', async (e) => {
       alert('Error: ' + (data.error || 'Failed to fetch repositories'));
     }
   } catch (err) {
+    clearInterval(progressInterval);
     alert('Network error occurred.');
   } finally {
-    document.getElementById('progress-bar').style.width = '100%';
     setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 400);
   }
 });
