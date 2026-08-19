@@ -160,12 +160,13 @@ DEPENDENCY_FILES = [
 
 
 def fetch_file_tree(owner, repo, default_branch):
-    """Return a flat list of file paths in the repo (top-level tree, non-recursive
-    truncation risk is acceptable here since we only match against known filenames)."""
-    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}"
+    """Return a list of file paths at the repo root only. We deliberately avoid
+    the recursive tree API here: for large repos it can return thousands of
+    entries, which is slow and memory-heavy for no benefit, since we only
+    match against known root-level filenames (requirements.txt, Dockerfile, etc)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/"
     try:
-        resp = requests.get(url, headers=get_github_headers(),
-                             params={"recursive": "1"}, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
         logger.error(f"Failed to fetch file tree for {owner}/{repo}: {e}")
         return []
@@ -173,8 +174,14 @@ def fetch_file_tree(owner, repo, default_branch):
     if resp.status_code != 200:
         return []
 
-    tree = resp.json().get("tree", [])
-    return [item["path"] for item in tree if item.get("type") == "blob"]
+    try:
+        items = resp.json()
+        if not isinstance(items, list):
+            return []
+        return [item["name"] for item in items if item.get("type") == "file"]
+    except Exception as e:
+        logger.error(f"Failed to parse file tree for {owner}/{repo}: {e}")
+        return []
 
 
 def fetch_file_content(owner, repo, path, max_chars=2000):
@@ -200,13 +207,13 @@ def fetch_file_content(owner, repo, path, max_chars=2000):
     return content[:max_chars]
 
 
-def fetch_dependency_files(owner, repo, file_paths):
-    """Given the repo's file tree, fetch the contents of any recognized
-    dependency/config files found at the repo root."""
+def fetch_dependency_files(owner, repo, file_names):
+    """Given the repo's root-level file names, fetch the contents of any
+    recognized dependency/config files found."""
     found = {}
-    root_files = {p for p in file_paths if "/" not in p}
+    file_set = set(file_names)
     for fname in DEPENDENCY_FILES:
-        if fname in root_files:
+        if fname in file_set:
             content = fetch_file_content(owner, repo, fname)
             if content:
                 found[fname] = content
