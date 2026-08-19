@@ -3,3 +3,4 @@ gunicorn
 requests
 markdown
 google-generativeai
+bleach
