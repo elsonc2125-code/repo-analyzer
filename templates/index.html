@@ -341,16 +341,46 @@ function openDeepDive(index) {
   const pros = (analysis.pros || []).map(p => `<li>${escapeHtml(p)}</li>`).join('');
   const cons = (analysis.cons || []).map(c => `<li>${escapeHtml(c)}</li>`).join('');
 
+  // Phase 2 data, now surfaced in the UI. Guard every field since older cached
+  // results (or repos where a metadata call failed) may not have these set.
+  const license = repo.license ? escapeHtml(repo.license) : 'None detected';
+  const contributors = (repo.contributor_count !== null && repo.contributor_count !== undefined) ? repo.contributor_count : 'Unknown';
+  const openIssues = (repo.open_issues !== null && repo.open_issues !== undefined) ? repo.open_issues : 'Unknown';
+  const latestRelease = repo.latest_release ? escapeHtml(repo.latest_release) : 'No releases found';
+  const depFiles = (repo.dependency_files_found || []).map(f => `<span class="tag">${escapeHtml(f)}</span>`).join('');
+  const useIf = analysis.use_if ? escapeHtml(analysis.use_if) : null;
+  const avoidIf = analysis.avoid_if ? escapeHtml(analysis.avoid_if) : null;
+
+  const verdictBlock = (useIf || avoidIf) ? `
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+      <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid var(--accent); padding: 12px; border-radius: 6px;">
+        <strong style="color: var(--accent); display: block; margin-bottom: 4px;">✅ Use this if...</strong>
+        <span style="font-size: 0.9rem;">${useIf || 'Not specified'}</span>
+      </div>
+      <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); padding: 12px; border-radius: 6px;">
+        <strong style="color: var(--danger); display: block; margin-bottom: 4px;">⚠️ Avoid this if...</strong>
+        <span style="font-size: 0.9rem;">${avoidIf || 'Not specified'}</span>
+      </div>
+    </div>` : '';
+
   document.getElementById('modal-body-content').innerHTML = `
     <div style="margin-bottom:16px;">
       <span class="score-badge ${analysis.relevance_score >= 8 ? 'score-high' : 'score-med'}">Overall Score: ${analysis.relevance_score}/10</span>
       <span style="margin-left: 12px; color: var(--text-muted);">Setup: <strong>${escapeHtml(analysis.setup_difficulty)}</strong></span>
     </div>
-    <div style="display:flex; gap:16px; margin-bottom:16px; font-size:0.85rem; color: var(--text-muted);">
+    <div style="display:flex; gap:16px; margin-bottom:16px; font-size:0.85rem; color: var(--text-muted); flex-wrap: wrap;">
       <div>🎯 Goal Match: <strong style="color:var(--text);">${analysis.goal_match_score ?? '-'}/10</strong></div>
       <div>🔧 Maintenance: <strong style="color:var(--text);">${analysis.maintenance_score ?? '-'}/10</strong></div>
       <div>👥 Community: <strong style="color:var(--text);">${analysis.community_score ?? '-'}/10</strong></div>
     </div>
+    <div style="display:flex; gap:16px; margin-bottom:16px; font-size:0.85rem; color: var(--text-muted); flex-wrap: wrap; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 10px 0;">
+      <div>📜 License: <strong style="color:var(--text);">${license}</strong></div>
+      <div>👤 Contributors: <strong style="color:var(--text);">${contributors}</strong></div>
+      <div>⚠️ Open Issues: <strong style="color:var(--text);">${openIssues}</strong></div>
+      <div>🏷️ Latest Release: <strong style="color:var(--text);">${latestRelease}</strong></div>
+    </div>
+    ${depFiles ? `<div style="margin-bottom:16px; font-size:0.85rem;"><span style="color:var(--text-muted);">📦 Dependency files found: </span>${depFiles}</div>` : ''}
+    ${verdictBlock}
     <p><strong>Goal Assessment:</strong> ${escapeHtml(analysis.match_summary)}</p>
     <div class="pro-con-grid">
       <div class="pro-box"><strong style="color: var(--accent);">Pros</strong><ul style="margin-left: 16px; margin-top: 6px;">${pros}</ul></div>
