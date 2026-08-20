@@ -39,6 +39,9 @@ th { background: #182232; font-size: 0.8rem; color: var(--text-muted); text-tran
 .score-med { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
 .score-low { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
 .tag { display: inline-block; background: #334155; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; margin-right: 4px; margin-bottom: 4px; }
+.tag.license-good { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+.tag.license-warn { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+.tag.license-none { background: rgba(148, 163, 184, 0.12); color: var(--text-muted); border: 1px solid var(--border); }
 .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 100; justify-content: center; align-items: center; }
 .modal-content { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; width: 90%; max-width: 900px; max-height: 85vh; display: flex; flex-direction: column; overflow: hidden; }
 .modal-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
@@ -113,6 +116,7 @@ th { background: #182232; font-size: 0.8rem; color: var(--text-muted); text-tran
 
 <!-- Results Section -->
 <div id="results-section" style="display: none;">
+<div id="hero-card-container"></div>
 <div class="controls-bar">
 <div style="display: flex; align-items: center; gap: 12px;">
 <h2 id="results-count">Results</h2>
@@ -293,10 +297,73 @@ document.getElementById('search-form').addEventListener('submit', async (e) => {
   }
 });
 
+// Categorizes a license name into a CSS class for color-coded badges.
+// Permissive licenses (MIT, Apache, BSD) are the safest for most use cases,
+// so they get a green treatment; copyleft (GPL) gets a caution color.
+function getLicenseClass(licenseName) {
+  if (!licenseName) return '';
+  const l = licenseName.toLowerCase();
+  if (l.includes('none detected') || l.includes('no license')) return 'license-none';
+  if (l.includes('mit') || l.includes('apache') || l.includes('bsd') || l.includes('isc')) return 'license-good';
+  if (l.includes('gpl')) return 'license-warn';
+  return '';
+}
+
+function renderHeroCard(results) {
+  const container = document.getElementById('hero-card-container');
+  container.innerHTML = '';
+
+  if (results.length === 0) return;
+
+  const top = results[0]; // results are already sorted by relevance_score server-side
+  const analysis = top.analysis;
+  const score = analysis.relevance_score;
+
+  // Only show the hero treatment if the top result is actually a strong match.
+  // A 4.2/10 "best of a bad bunch" shouldn't get a triumphant banner.
+  if (score < 7) return;
+
+  const useIf = analysis.use_if ? escapeHtml(analysis.use_if) : null;
+  const heroLicense = top.license ? escapeHtml(top.license) : 'None detected';
+  const heroLicenseClass = getLicenseClass(heroLicense);
+  const stackTags = (analysis.tech_stack || [])
+    .map(t => `<span class="tag">${escapeHtml(t)}</span>`)
+    .join('');
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.cssText = 'border: 1px solid var(--accent); background: linear-gradient(135deg, rgba(16,185,129,0.08), var(--card-bg)); margin-bottom: 20px;';
+  card.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap: wrap; gap: 12px;">
+      <div>
+        <div style="color: var(--accent); font-weight:700; font-size:0.8rem; letter-spacing:0.5px; margin-bottom:6px;">🏆 BEST MATCH</div>
+        <a href="${escapeHtml(top.url)}" target="_blank" style="color: var(--text); font-size:1.3rem; font-weight:700; text-decoration:none;">${escapeHtml(top.full_name)}</a>
+        <div style="color: var(--text-muted); font-size:0.9rem; margin-top:4px; max-width: 500px;">${escapeHtml(top.description)}</div>
+      </div>
+      <div class="score-badge score-high" style="font-size:1.1rem; padding:8px 14px;">${score}/10</div>
+    </div>
+    <div style="display:flex; gap:20px; margin: 16px 0; font-size:0.85rem; color: var(--text-muted); flex-wrap: wrap;">
+      <div>🎯 Goal Match: <strong style="color:var(--text);">${analysis.goal_match_score ?? '-'}/10</strong></div>
+      <div>🔧 Maintenance: <strong style="color:var(--text);">${analysis.maintenance_score ?? '-'}/10</strong></div>
+      <div>👥 Community: <strong style="color:var(--text);">${analysis.community_score ?? '-'}/10</strong></div>
+      <div>★ ${top.stars.toLocaleString()} stars</div>
+      <span class="tag ${heroLicenseClass}">📜 ${heroLicense}</span>
+    </div>
+    ${stackTags ? `<div style="margin-bottom:14px;">${stackTags}</div>` : ''}
+    ${useIf ? `<div style="background: rgba(16, 185, 129, 0.12); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 4px; margin-bottom:14px; font-size:0.9rem;"><strong style="color:var(--accent);">Why this ranked #1:</strong> ${useIf}</div>` : ''}
+    <div style="display:flex; gap:10px;">
+      <button class="btn-secondary" style="padding: 6px 12px; font-size:0.85rem;" onclick="openDeepDive(0)">Inspect</button>
+      <button class="btn-secondary" style="padding: 6px 12px; font-size:0.85rem;" onclick="bookmarkRepo(0)">★ Bookmark</button>
+    </div>
+  `;
+  container.appendChild(card);
+}
+
 function renderResults(results) {
   const tbody = document.getElementById('results-table-body');
   tbody.innerHTML = '';
   document.getElementById('results-count').innerText = `Scanned ${results.length} Repositories`;
+  renderHeroCard(results);
 
   results.forEach((repo, index) => {
     const score = repo.analysis.relevance_score;
@@ -307,6 +374,8 @@ function renderResults(results) {
     const stackTags = (repo.analysis.tech_stack || [])
       .map(t => `<span class="tag">${escapeHtml(t)}</span>`)
       .join('');
+    const rowLicense = repo.license ? escapeHtml(repo.license) : 'None detected';
+    const rowLicenseClass = getLicenseClass(rowLicense);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -315,7 +384,7 @@ function renderResults(results) {
         <a href="${escapeHtml(repo.url)}" target="_blank" style="color: var(--primary); font-weight:600; text-decoration:none;">${escapeHtml(repo.full_name)}</a>
         <div style="font-size:0.8rem; color:var(--text-muted); overflow: hidden; max-width: 300px;">${escapeHtml(repo.description)}</div>
       </td>
-      <td>★ ${repo.stars.toLocaleString()}</td>
+      <td>★ ${repo.stars.toLocaleString()}<br><span class="tag ${rowLicenseClass}" style="margin-top:4px;">📜 ${rowLicense}</span></td>
       <td><span class="score-badge ${scoreClass}">${score}/10</span></td>
       <td>${escapeHtml(repo.analysis.setup_difficulty)}</td>
       <td>${stackTags}</td>
@@ -374,7 +443,7 @@ function openDeepDive(index) {
       <div>👥 Community: <strong style="color:var(--text);">${analysis.community_score ?? '-'}/10</strong></div>
     </div>
     <div style="display:flex; gap:16px; margin-bottom:16px; font-size:0.85rem; color: var(--text-muted); flex-wrap: wrap; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 10px 0;">
-      <div>📜 License: <strong style="color:var(--text);">${license}</strong></div>
+      <div>📜 License: <span class="tag ${getLicenseClass(license)}" style="margin:0;">${license}</span></div>
       <div>👤 Contributors: <strong style="color:var(--text);">${contributors}</strong></div>
       <div>⚠️ Open Issues: <strong style="color:var(--text);">${openIssues}</strong></div>
       <div>🏷️ Latest Release: <strong style="color:var(--text);">${latestRelease}</strong></div>
