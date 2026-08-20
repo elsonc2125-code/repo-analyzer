@@ -195,7 +195,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-const SECONDS_PER_REPO = 16; // bumped up for Phase 2: each repo now fetches file tree, dependency files, and metadata
+const SECONDS_PER_REPO = 18; // bumped again: added lightweight issue-title sampling (2 more GitHub calls per repo)
 const originalTitle = document.title;
 let titleFlashInterval = null;
 
