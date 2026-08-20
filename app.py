@@ -220,6 +220,40 @@ def fetch_dependency_files(owner, repo, file_names):
     return found
 
 
+def fetch_issue_sample(owner, repo):
+    """Pull a small, capped sample of recent issue titles as a lightweight
+    evidence signal. Deliberately minimal: titles only, no bodies, no comments,
+    no PRs, 2 API calls total. This is meant to nudge the AI toward real
+    signals of project health, not replace star-count bias with issue-count
+    bias, so we keep the sample tiny and let the prompt do the interpreting."""
+    sample = {"open": [], "closed": []}
+
+    for state in ("open", "closed"):
+        try:
+            resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/issues",
+                headers=get_github_headers(),
+                params={"state": state, "sort": "updated", "direction": "desc", "per_page": 3},
+                timeout=REQUEST_TIMEOUT
+            )
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch {state} issues for {owner}/{repo}: {e}")
+            continue
+
+        if resp.status_code != 200:
+            continue
+
+        for issue in resp.json():
+            # The issues endpoint also returns PRs; skip those, we only want issues.
+            if "pull_request" in issue:
+                continue
+            title = issue.get("title", "").strip()
+            if title:
+                sample[state].append(title[:150])
+
+    return sample
+
+
 def fetch_repo_metadata(owner, repo):
     """Pull license, contributor count, open issue count, and latest release.
     Each call is independent and best-effort: a failure in one shouldn't block
@@ -272,7 +306,7 @@ def fetch_repo_metadata(owner, repo):
     return metadata
 
 
-def build_repo_snapshot(readme_text, dependency_files, metadata):
+def build_repo_snapshot(readme_text, dependency_files, metadata, issue_sample=None):
     """Turn raw dependency file contents + metadata into a compact, structured
     text block for the AI prompt. Keeps each file short so the whole snapshot
     stays within a reasonable prompt size even for repos with several files."""
@@ -286,6 +320,17 @@ def build_repo_snapshot(readme_text, dependency_files, metadata):
         lines.append(f"Latest release: {metadata['latest_release']} ({metadata.get('latest_release_date', 'date unknown')})")
     else:
         lines.append("Latest release: None found")
+
+    if issue_sample and (issue_sample.get("open") or issue_sample.get("closed")):
+        lines.append("\n--- RECENT ISSUE TITLES (small sample, evidence only) ---")
+        if issue_sample.get("open"):
+            lines.append("Recently updated open issues:")
+            for title in issue_sample["open"]:
+                lines.append(f"- {title}")
+        if issue_sample.get("closed"):
+            lines.append("Recently closed issues:")
+            for title in issue_sample["closed"]:
+                lines.append(f"- {title}")
 
     if dependency_files:
         lines.append("\n--- DEPENDENCY / CONFIG FILES FOUND ---")
@@ -329,11 +374,24 @@ def analyze_with_llm(repo_name, description, snapshot, user_goal, query):
 
     prompt = f"""Evaluate this GitHub repository against the user's goal. You are looking at
 more than just the README: you also have the repository's actual dependency
-files, license, contributor count, issue count, and release history. Use ALL
-of this to judge whether the repo is genuinely a good fit, not just whether
-its description sounds relevant. A repo with a great README but no releases,
-no dependency files, and one contributor should be treated with more caution
-than the summary alone would suggest.
+files, license, contributor count, issue count, release history, and a small
+sample of recent issue titles. Use ALL of this to judge whether the repo is
+genuinely a good fit, not just whether its description sounds relevant. A repo
+with a great README but no releases, no dependency files, and one contributor
+should be treated with more caution than the summary alone would suggest.
+
+Important scoring guidance:
+- Star count is a popularity signal, NOT a quality signal. Do not penalize a
+  technically excellent or niche repository just because it has few stars.
+  A low-star repo can and should score highly if it is a strong match.
+- Prioritize in this order: (1) goal match, (2) technical fit, (3) project
+  health (maintenance, license, releases), (4) community activity evidence,
+  (5) popularity as a minor supporting signal only.
+- If a sample of recent issue titles is provided, treat it as a small,
+  non-representative hint about project activity and pain points, not a
+  verdict. A "Windows install broken" issue doesn't mean the repo is bad; a
+  "feature request" issue doesn't mean it's unhealthy. Don't overweight a
+  handful of issue titles any more than you'd overweight star count.
 
 User Goal: "{user_goal}"
 Key terms of interest: {key_terms}
@@ -366,6 +424,22 @@ Respond ONLY with valid JSON in this exact structure:
         return parsed
     except Exception as e:
         logger.error(f"Gemini API failed for {repo_name}: {e}")
+        error_str = str(e)
+        if "429" in error_str or "quota" in error_str.lower():
+            fallback_result = {
+                "goal_match_score": 0,
+                "match_summary": "Daily AI analysis limit reached. Try again after the quota resets (usually within 24 hours), or upgrade the Gemini plan for higher limits.",
+                "key_features": [],
+                "tech_stack": [],
+                "setup_difficulty": "Unknown",
+                "pros": [],
+                "cons": [],
+                "recommendation": "Daily analysis quota reached. Please try again later.",
+                "use_if": "",
+                "avoid_if": ""
+            }
+            _analysis_cache[cache_key] = fallback_result
+            return fallback_result
 
     # Fallback if the API call fails
     fallback_result = {
@@ -454,8 +528,9 @@ def process_repo(item, goal, query):
     file_paths = fetch_file_tree(owner, name, default_branch)
     dependency_files = fetch_dependency_files(owner, name, file_paths)
     metadata = fetch_repo_metadata(owner, name)
+    issue_sample = fetch_issue_sample(owner, name)
 
-    snapshot = build_repo_snapshot(readme_text, dependency_files, metadata)
+    snapshot = build_repo_snapshot(readme_text, dependency_files, metadata, issue_sample)
     analysis = analyze_with_llm(item["full_name"], item.get("description") or "", snapshot, goal, query)
 
     try:
