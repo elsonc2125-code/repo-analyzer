@@ -13,6 +13,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, render_template, request, jsonify, Response
+from werkzeug.exceptions import HTTPException
 import requests
 import markdown
 import bleach
@@ -662,6 +663,18 @@ def compare():
     return render_template("compare.html", repos=repos)
 
 
+def csv_safe(value):
+    """Neutralize spreadsheet formula injection. If a cell value starts with
+    =, +, -, @, tab, or CR, Excel/Sheets/LibreOffice may interpret it as a
+    formula when the CSV is opened. Since these values originate from repo
+    descriptions and AI-generated text (both attacker-influenceable), prefix
+    a leading apostrophe to force the cell to be treated as plain text."""
+    s = "" if value is None else str(value)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
 @app.route("/export", methods=["POST"])
 def export():
     data = request.get_json(silent=True) or {}
@@ -674,10 +687,10 @@ def export():
     for repo in results:
         analysis = repo.get("analysis", {})
         writer.writerow([
-            repo.get("full_name", ""), repo.get("url", ""), repo.get("stars", ""),
-            analysis.get("relevance_score", ""), analysis.get("setup_difficulty", ""),
-            ", ".join(analysis.get("tech_stack", []) or []), repo.get("last_updated", ""),
-            analysis.get("match_summary", ""), analysis.get("recommendation", "")
+            csv_safe(repo.get("full_name", "")), csv_safe(repo.get("url", "")), repo.get("stars", ""),
+            analysis.get("relevance_score", ""), csv_safe(analysis.get("setup_difficulty", "")),
+            csv_safe(", ".join(analysis.get("tech_stack", []) or [])), repo.get("last_updated", ""),
+            csv_safe(analysis.get("match_summary", "")), csv_safe(analysis.get("recommendation", ""))
         ])
     csv_data = output.getvalue()
     output.close()
@@ -757,10 +770,15 @@ def history():
 
 
 # ==========================================
-# Global error handler: never leak raw exceptions to the client
+# Global error handler: never leak raw exceptions to the client.
+# IMPORTANT: re-raise HTTPException (404, 405, etc.) so Flask/Werkzeug still
+# returns its normal status codes and pages instead of masking every routing
+# error as a 500.
 # ==========================================
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
+    if isinstance(e, HTTPException):
+        return e
     logger.error(f"Unhandled exception: {e}")
     return jsonify({"error": "Something went wrong. Please try again."}), 500
 
