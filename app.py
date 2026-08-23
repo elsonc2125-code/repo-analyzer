@@ -6,58 +6,30 @@ import sqlite3
 import hashlib
 import io
 import csv
-import logging
 import webbrowser
 from threading import Timer
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-
 from flask import Flask, render_template, request, jsonify, Response
-from werkzeug.exceptions import HTTPException
 import requests
 import markdown
-import bleach
-import google.generativeai as genai
 
 app = Flask(__name__)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 DB_FILE = "database.db"
 _analysis_cache = {}
 
-REQUEST_TIMEOUT = 10  # seconds, for GitHub API calls
-
-# ==========================================
-# README sanitization
-# ==========================================
-ALLOWED_TAGS = ["p", "a", "code", "pre", "ul", "ol", "li", "strong", "em",
-                "h1", "h2", "h3", "br", "blockquote"]
-ALLOWED_ATTRS = {"a": ["href", "title"]}
-
-
-def render_readme_html(readme_text):
-    raw_html = markdown.markdown(readme_text, extensions=["fenced_code", "tables"])
-    return bleach.clean(raw_html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
-
-
-# Gemini API config
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-3.6-flash")
-else:
-    model = None
-    logger.warning("GEMINI_API_KEY is not set. AI analysis will be unavailable.")
+# Google Gemini API config - free tier, no credit card required
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # ==========================================
 # Database Setup
 # ==========================================
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+
     # Bookmarks Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bookmarks (
@@ -73,6 +45,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     # Search History Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS search_history (
@@ -86,48 +59,49 @@ def init_db():
             searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     conn.commit()
     conn.close()
-
 
 init_db()
 
 # ==========================================
 # Helper Functions
 # ==========================================
+
 def get_db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def get_cache_key(repo_name, goal):
     return hashlib.md5(f"{repo_name}:{goal}".encode()).hexdigest()
-
 
 def extract_goal_terms(goal, query):
     combined = f'{goal} {query}'.lower()
     words = set(re.findall(r'\b\w{3,}\b', combined))
+
     EXPAND = {
-        'control': ['adjust', 'setting', 'param', 'config', 'option', 'customize', 'tune', 'modify'],
-        'detect': ['recogni', 'find', 'extract', 'identify', 'discover'],
-        'convert': ['transform', 'translat', 'map', 'turn'],
-        'generate': ['create', 'produce', 'build', 'make', 'output'],
-        'train': ['learn', 'fine.tune', 'finetune', 'fit'],
+        'control':   ['adjust', 'setting', 'param', 'config', 'option', 'customize', 'tune', 'modify'],
+        'detect':    ['recogni', 'find', 'extract', 'identify', 'discover'],
+        'convert':   ['transform', 'translat', 'map', 'turn'],
+        'generate':  ['create', 'produce', 'build', 'make', 'output'],
+        'train':     ['learn', 'fine.tune', 'finetune', 'fit'],
         'real.time': ['realtime', 'live', 'streaming', 'online'],
-        'gui': ['graphical', 'interface', 'tkinter', 'qt', 'gradio', 'streamlit', 'webui'],
-        'test': ['pytest', 'unittest'],
-        'deploy': ['docker', 'container', 'cloud'],
+        'gui':       ['graphical', 'interface', 'tkinter', 'qt', 'gradio', 'streamlit', 'webui'],
+        'test':      ['pytest', 'unittest'],
+        'deploy':    ['docker', 'container', 'cloud'],
     }
+
     expanded = set(words)
     for w in list(words):
         for key, syns in EXPAND.items():
             all_forms = [key] + syns
             if any(w in form or form in w for form in all_forms if len(form) >= 4):
                 expanded.update(syns)
+
     file_terms = sorted([t for t in expanded if len(t) >= 3], key=len, reverse=True)
     return {'raw_words': words, 'expanded': expanded, 'file_terms': file_terms}
-
 
 def get_github_headers():
     token = os.getenv("GITHUB_TOKEN")
@@ -136,418 +110,136 @@ def get_github_headers():
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-
 def fetch_readme(owner, repo):
     url = f"https://api.github.com/repos/{owner}/{repo}/readme"
-    try:
-        resp = requests.get(url, headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch README for {owner}/{repo}: {e}")
-        return "No README available or repository is private."
-
+    resp = requests.get(url, headers=get_github_headers())
     if resp.status_code == 200:
         data = resp.json()
         content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="ignore")
         return content[:6000]
     return "No README available or repository is private."
 
-
-# Files worth inspecting for tech stack, dependencies, and setup complexity.
-# Kept short and specific so we don't spam the GitHub API per repo.
-DEPENDENCY_FILES = [
-    "requirements.txt", "package.json", "pyproject.toml", "Pipfile",
-    "Dockerfile", "docker-compose.yml", ".env.example", "setup.py"
-]
-
-
-def fetch_file_tree(owner, repo, default_branch):
-    """Return a list of file paths at the repo root only. We deliberately avoid
-    the recursive tree API here: for large repos it can return thousands of
-    entries, which is slow and memory-heavy for no benefit, since we only
-    match against known root-level filenames (requirements.txt, Dockerfile, etc)."""
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/"
-    try:
-        resp = requests.get(url, headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch file tree for {owner}/{repo}: {e}")
-        return []
-
-    if resp.status_code != 200:
-        return []
-
-    try:
-        items = resp.json()
-        if not isinstance(items, list):
-            return []
-        return [item["name"] for item in items if item.get("type") == "file"]
-    except Exception as e:
-        logger.error(f"Failed to parse file tree for {owner}/{repo}: {e}")
-        return []
-
-
-def fetch_file_content(owner, repo, path, max_chars=2000):
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    try:
-        resp = requests.get(url, headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch {path} for {owner}/{repo}: {e}")
-        return None
-
-    if resp.status_code != 200:
-        return None
-
-    data = resp.json()
-    if data.get("encoding") != "base64":
-        return None
-
-    try:
-        content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="ignore")
-    except Exception:
-        return None
-
-    return content[:max_chars]
-
-
-def fetch_dependency_files(owner, repo, file_names):
-    """Given the repo's root-level file names, fetch the contents of any
-    recognized dependency/config files found."""
-    found = {}
-    file_set = set(file_names)
-    for fname in DEPENDENCY_FILES:
-        if fname in file_set:
-            content = fetch_file_content(owner, repo, fname)
-            if content:
-                found[fname] = content
-    return found
-
-
-def fetch_issue_sample(owner, repo):
-    """Pull a small, capped sample of recent issue titles as a lightweight
-    evidence signal. Deliberately minimal: titles only, no bodies, no comments,
-    no PRs, 2 API calls total. This is meant to nudge the AI toward real
-    signals of project health, not replace star-count bias with issue-count
-    bias, so we keep the sample tiny and let the prompt do the interpreting."""
-    sample = {"open": [], "closed": []}
-
-    for state in ("open", "closed"):
-        try:
-            resp = requests.get(
-                f"https://api.github.com/repos/{owner}/{repo}/issues",
-                headers=get_github_headers(),
-                params={"state": state, "sort": "updated", "direction": "desc", "per_page": 3},
-                timeout=REQUEST_TIMEOUT
-            )
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch {state} issues for {owner}/{repo}: {e}")
-            continue
-
-        if resp.status_code != 200:
-            continue
-
-        for issue in resp.json():
-            # The issues endpoint also returns PRs; skip those, we only want issues.
-            if "pull_request" in issue:
-                continue
-            title = issue.get("title", "").strip()
-            if title:
-                sample[state].append(title[:150])
-
-    return sample
-
-
-def fetch_repo_metadata(owner, repo):
-    """Pull license, contributor count, open issue count, and latest release.
-    Each call is independent and best-effort: a failure in one shouldn't block
-    the others or crash the whole analysis."""
-    metadata = {
-        "license": None,
-        "contributor_count": None,
-        "open_issues": None,
-        "latest_release": None,
-        "latest_release_date": None,
-    }
-
-    try:
-        resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}",
-                             headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            license_info = data.get("license") or {}
-            metadata["license"] = license_info.get("spdx_id") or license_info.get("name")
-            metadata["open_issues"] = data.get("open_issues_count")
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch repo metadata for {owner}/{repo}: {e}")
-
-    try:
-        resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}/contributors",
-                             headers=get_github_headers(), params={"per_page": 1, "anon": "true"},
-                             timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            # GitHub returns pagination info in the Link header; last page number
-            # approximates total contributor count without fetching every page.
-            link_header = resp.headers.get("Link", "")
-            match = re.search(r'page=(\d+)>; rel="last"', link_header)
-            if match:
-                metadata["contributor_count"] = int(match.group(1))
-            else:
-                metadata["contributor_count"] = len(resp.json())
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch contributors for {owner}/{repo}: {e}")
-
-    try:
-        resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}/releases/latest",
-                             headers=get_github_headers(), timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            metadata["latest_release"] = data.get("tag_name")
-            metadata["latest_release_date"] = data.get("published_at")
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch latest release for {owner}/{repo}: {e}")
-
-    return metadata
-
-
-def build_repo_snapshot(readme_text, dependency_files, metadata, issue_sample=None):
-    """Turn raw dependency file contents + metadata into a compact, structured
-    text block for the AI prompt. Keeps each file short so the whole snapshot
-    stays within a reasonable prompt size even for repos with several files."""
-    lines = []
-
-    lines.append("--- GITHUB METADATA ---")
-    lines.append(f"License: {metadata.get('license') or 'None detected'}")
-    lines.append(f"Contributors: {metadata.get('contributor_count') if metadata.get('contributor_count') is not None else 'Unknown'}")
-    lines.append(f"Open issues: {metadata.get('open_issues') if metadata.get('open_issues') is not None else 'Unknown'}")
-    if metadata.get("latest_release"):
-        lines.append(f"Latest release: {metadata['latest_release']} ({metadata.get('latest_release_date', 'date unknown')})")
-    else:
-        lines.append("Latest release: None found")
-
-    if issue_sample and (issue_sample.get("open") or issue_sample.get("closed")):
-        lines.append("\n--- RECENT ISSUE TITLES (small sample, evidence only) ---")
-        if issue_sample.get("open"):
-            lines.append("Recently updated open issues:")
-            for title in issue_sample["open"]:
-                lines.append(f"- {title}")
-        if issue_sample.get("closed"):
-            lines.append("Recently closed issues:")
-            for title in issue_sample["closed"]:
-                lines.append(f"- {title}")
-
-    if dependency_files:
-        lines.append("\n--- DEPENDENCY / CONFIG FILES FOUND ---")
-        for fname, content in dependency_files.items():
-            lines.append(f"\n[{fname}]")
-            lines.append(content[:1200])
-    else:
-        lines.append("\n--- DEPENDENCY / CONFIG FILES FOUND ---")
-        lines.append("None detected (no requirements.txt, package.json, pyproject.toml, Dockerfile, etc. at repo root).")
-
-    lines.append("\n--- README (truncated) ---")
-    lines.append(readme_text[:3000])
-
-    return "\n".join(lines)
-
-
-def analyze_with_llm(repo_name, description, snapshot, user_goal, query):
+def analyze_with_llm(repo_name, description, readme_text, user_goal, query):
     cache_key = get_cache_key(repo_name, user_goal)
     if cache_key in _analysis_cache:
         return _analysis_cache[cache_key]
 
-    # Handle missing Gemini key cleanly, before attempting any call
-    if model is None:
-        fallback_result = {
-            "goal_match_score": 0,
-            "match_summary": "AI analysis unavailable: GEMINI_API_KEY is not set.",
-            "key_features": [],
-            "tech_stack": [],
-            "setup_difficulty": "Unknown",
-            "pros": [],
-            "cons": [],
-            "recommendation": "Set GEMINI_API_KEY on the server and try again.",
-            "use_if": "",
-            "avoid_if": ""
-        }
-        _analysis_cache[cache_key] = fallback_result
-        return fallback_result
-
     terms = extract_goal_terms(user_goal, query)
     key_terms = ", ".join(terms['file_terms'][:12])
 
-    prompt = f"""Evaluate this GitHub repository against the user's goal. You are looking at
-more than just the README: you also have the repository's actual dependency
-files, license, contributor count, issue count, release history, and a small
-sample of recent issue titles. Use ALL of this to judge whether the repo is
-genuinely a good fit, not just whether its description sounds relevant. A repo
-with a great README but no releases, no dependency files, and one contributor
-should be treated with more caution than the summary alone would suggest.
-
-Important scoring guidance:
-- Star count is a popularity signal, NOT a quality signal. Do not penalize a
-  technically excellent or niche repository just because it has few stars.
-  A low-star repo can and should score highly if it is a strong match.
-- Prioritize in this order: (1) goal match, (2) technical fit, (3) project
-  health (maintenance, license, releases), (4) community activity evidence,
-  (5) popularity as a minor supporting signal only.
-- If a sample of recent issue titles is provided, treat it as a small,
-  non-representative hint about project activity and pain points, not a
-  verdict. A "Windows install broken" issue doesn't mean the repo is bad; a
-  "feature request" issue doesn't mean it's unhealthy. Don't overweight a
-  handful of issue titles any more than you'd overweight star count.
-
+    prompt = f"""Evaluate this GitHub repository against the user's goal.
 User Goal: "{user_goal}"
 Key terms of interest: {key_terms}
 Repository Name: "{repo_name}"
 Description: "{description}"
-
-{snapshot}
+README Snippet:
+{readme_text[:3000]}
 
 Respond ONLY with valid JSON in this exact structure:
 {{
-"goal_match_score": 8,
-"match_summary": "Short explanation of why it matches or fails the goal, referencing concrete evidence (dependencies, license, activity) where relevant",
-"key_features": ["Feature 1", "Feature 2"],
-"tech_stack": ["Python", "Flask"],
-"setup_difficulty": "Easy",
-"pros": ["Pro 1", "Pro 2"],
-"cons": ["Con 1", "Con 2"],
-"recommendation": "Short 1-sentence verdict on whether they should use it",
-"use_if": "One short sentence: use this repo if...",
-"avoid_if": "One short sentence: avoid this repo if..."
+  "goal_match_score": 8,
+  "match_summary": "Short explanation of why it matches or fails the goal",
+  "key_features": ["Feature 1", "Feature 2"],
+  "tech_stack": ["Python", "Flask"],
+  "setup_difficulty": "Easy",
+  "pros": ["Pro 1", "Pro 2"],
+  "cons": ["Con 1", "Con 2"],
+  "recommendation": "Short 1-sentence verdict on whether they should use it"
 }}"""
 
+    # Google Gemini 2.5 Flash - free tier, no credit card required
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            raise ValueError("GEMINI_API_KEY environment variable is not set.")
+
+        response = requests.post(
+            GEMINI_URL,
+            params={"key": gemini_key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "systemInstruction": {
+                    "parts": [{"text": "You are a software engineer evaluating GitHub repositories. Output raw JSON only. Do not include markdown codeblocks or conversational filler."}]
+                },
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2}
+            },
+            timeout=60
         )
-        parsed = json.loads(response.text)
+        response.raise_for_status()
+        data = response.json()
+        raw_content = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        cleaned_content = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content).strip()
+        parsed = json.loads(cleaned_content)
         _analysis_cache[cache_key] = parsed
         return parsed
     except Exception as e:
-        logger.error(f"Gemini API failed for {repo_name}: {e}")
-        error_str = str(e)
-        if "429" in error_str or "quota" in error_str.lower():
-            fallback_result = {
-                "goal_match_score": 0,
-                "match_summary": "Daily AI analysis limit reached. Try again after the quota resets (usually within 24 hours), or upgrade the Gemini plan for higher limits.",
-                "key_features": [],
-                "tech_stack": [],
-                "setup_difficulty": "Unknown",
-                "pros": [],
-                "cons": [],
-                "recommendation": "Daily analysis quota reached. Please try again later.",
-                "use_if": "",
-                "avoid_if": ""
-            }
-            _analysis_cache[cache_key] = fallback_result
-            return fallback_result
+        print(f"Gemini API failed: {e}")
 
-    # Fallback if the API call fails
+    # Fallback if the API call fails (missing/invalid key, network issue, bad JSON, etc.)
     fallback_result = {
         "goal_match_score": 0,
-        "match_summary": "AI analysis failed. Please try again shortly.",
+        "match_summary": "AI analysis failed. Check that GEMINI_API_KEY is set correctly.",
         "key_features": [],
         "tech_stack": [],
         "setup_difficulty": "Unknown",
         "pros": [],
         "cons": [],
-        "recommendation": "Manual review required.",
-        "use_if": "",
-        "avoid_if": ""
+        "recommendation": "Manual review required."
     }
     _analysis_cache[cache_key] = fallback_result
     return fallback_result
 
-
-def compute_maintenance_score(item, metadata=None):
-    """Blends last-push recency (still the strongest signal) with release
-    recency and open-issue count so a repo that was updated once and then
-    abandoned doesn't score the same as one under active development."""
+def compute_maintenance_score(item):
+    """0-10 score based on how recently the repo was pushed to. Deterministic, no LLM guessing."""
     pushed_at = item.get("pushed_at") or item.get("updated_at")
     try:
         pushed_dt = datetime.strptime(pushed_at, "%Y-%m-%dT%H:%M:%SZ")
-        days_since_push = (datetime.utcnow() - pushed_dt).days
+        days = (datetime.utcnow() - pushed_dt).days
     except Exception:
-        days_since_push = None
-
-    if days_since_push is None:
-        push_score = 0
-    elif days_since_push <= 30: push_score = 10
-    elif days_since_push <= 90: push_score = 8
-    elif days_since_push <= 180: push_score = 6
-    elif days_since_push <= 365: push_score = 4
-    elif days_since_push <= 730: push_score = 2
-    else: push_score = 0
-
-    if not metadata:
-        return push_score
-
-    # Release recency: a repo that has never released anything, or hasn't in
-    # years, is weaker evidence of active maintenance even if commits are recent.
-    release_date = metadata.get("latest_release_date")
-    if release_date:
-        try:
-            release_dt = datetime.strptime(release_date, "%Y-%m-%dT%H:%M:%SZ")
-            days_since_release = (datetime.utcnow() - release_dt).days
-            if days_since_release <= 180: release_score = 10
-            elif days_since_release <= 365: release_score = 7
-            elif days_since_release <= 730: release_score = 4
-            else: release_score = 2
-        except Exception:
-            release_score = 3
-    else:
-        release_score = 3  # no releases at all isn't disqualifying, just weaker evidence
-
-    # Open issue count as a rough signal of unaddressed backlog. This is a blunt
-    # instrument (a popular repo naturally has more issues) so it's weighted lightly.
-    open_issues = metadata.get("open_issues")
-    if open_issues is None:
-        issue_score = 5
-    elif open_issues <= 20: issue_score = 10
-    elif open_issues <= 75: issue_score = 7
-    elif open_issues <= 200: issue_score = 5
-    else: issue_score = 3
-
-    blended = 0.6 * push_score + 0.25 * release_score + 0.15 * issue_score
-    return round(blended, 1)
-
+        return 0
+    if days <= 30:
+        return 10
+    if days <= 90:
+        return 8
+    if days <= 180:
+        return 6
+    if days <= 365:
+        return 4
+    if days <= 730:
+        return 2
+    return 0
 
 def compute_community_score(item):
+    """0-10 score on a log scale of stars+forks, so 50k-star repos don't just max out identically to 500-star ones."""
     import math
     stars = item.get("stargazers_count", 0) or 0
     forks = item.get("forks_count", 0) or 0
     score = min(10, math.log10(stars + forks + 1) * 3.3)
     return round(score, 1)
 
-
 def process_repo(item, goal, query):
     owner = item["owner"]["login"]
     name = item["name"]
-    default_branch = item.get("default_branch", "main")
-
     readme_text = fetch_readme(owner, name)
-    file_paths = fetch_file_tree(owner, name, default_branch)
-    dependency_files = fetch_dependency_files(owner, name, file_paths)
-    metadata = fetch_repo_metadata(owner, name)
-    issue_sample = fetch_issue_sample(owner, name)
-
-    snapshot = build_repo_snapshot(readme_text, dependency_files, metadata, issue_sample)
-    analysis = analyze_with_llm(item["full_name"], item.get("description") or "", snapshot, goal, query)
+    analysis = analyze_with_llm(item["full_name"], item.get("description") or "", readme_text, goal, query)
 
     try:
         last_updated = datetime.strptime(item["updated_at"], "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
     except Exception:
         last_updated = item.get("updated_at", "")
 
+    # Composite scoring: blend Claude's qualitative goal-match with deterministic GitHub signals.
+    # This stops a repo that "reads well" but is abandoned from outscoring an actively maintained one.
     goal_score = analysis.get("goal_match_score", analysis.get("relevance_score", 0)) or 0
-    maintenance_score = compute_maintenance_score(item, metadata)
+    maintenance_score = compute_maintenance_score(item)
     community_score = compute_community_score(item)
     composite_score = round(0.6 * goal_score + 0.25 * maintenance_score + 0.15 * community_score, 1)
 
     analysis["goal_match_score"] = goal_score
     analysis["maintenance_score"] = maintenance_score
     analysis["community_score"] = community_score
-    analysis["relevance_score"] = composite_score
+    analysis["relevance_score"] = composite_score  # used for sorting/badge, kept for frontend compatibility
 
     return {
         "full_name": item["full_name"],
@@ -555,26 +247,20 @@ def process_repo(item, goal, query):
         "url": item["html_url"],
         "stars": item.get("stargazers_count", 0),
         "last_updated": last_updated,
-        "readme_html": render_readme_html(readme_text),
-        "license": metadata.get("license"),
-        "contributor_count": metadata.get("contributor_count"),
-        "open_issues": metadata.get("open_issues"),
-        "latest_release": metadata.get("latest_release"),
-        "dependency_files_found": list(dependency_files.keys()),
+        "readme_html": markdown.markdown(readme_text, extensions=["fenced_code", "tables"]),
         "analysis": analysis
     }
-
 
 # ==========================================
 # Flask Routes
 # ==========================================
+
 @app.route("/")
 def index():
     try:
         return render_template("index.html")
     except Exception:
-        return "<h1>Flask is running!</h1>"
-
+        return "<h1>Flask is running!</h1><p>Your file was chopped in half, but I fixed the startup.</p>"
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -582,7 +268,7 @@ def search():
     goal = request.form.get("goal", "").strip()
     language = request.form.get("language", "").strip()
     min_stars = request.form.get("min_stars", "0").strip() or "0"
-    max_results = request.form.get("max_results", "5").strip() or "5"
+    max_results = request.form.get("max_results", "20").strip() or "20"
 
     if not query:
         return jsonify({"error": "Search query is required."}), 400
@@ -608,35 +294,29 @@ def search():
         resp = requests.get(
             "https://api.github.com/search/repositories",
             headers=get_github_headers(),
-            params={"q": gh_query, "sort": "stars", "order": "desc", "per_page": max_results_int},
-            timeout=REQUEST_TIMEOUT
+            params={"q": gh_query, "sort": "stars", "order": "desc", "per_page": max_results_int}
         )
     except requests.RequestException as e:
-        logger.error(f"Failed to reach GitHub search API: {e}")
-        return jsonify({"error": "Failed to reach GitHub. Please try again."}), 502
-
-    # Handle GitHub rate limiting with a friendly message
-    if resp.status_code == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
-        return jsonify({"error": "GitHub search limit reached. Please try again in a few minutes."}), 429
+        return jsonify({"error": f"Failed to reach GitHub: {e}"}), 502
 
     if resp.status_code != 200:
-        logger.error(f"GitHub API error ({resp.status_code}): {resp.text[:200]}")
-        return jsonify({"error": "GitHub API returned an error. Please try again."}), resp.status_code
+        return jsonify({"error": f"GitHub API error ({resp.status_code}): {resp.text[:200]}"}), resp.status_code
 
     items = resp.json().get("items", [])[:max_results_int]
 
     results = []
     if items:
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(process_repo, item, goal, query) for item in items]
             for f in futures:
                 try:
                     results.append(f.result())
                 except Exception as e:
-                    logger.error(f"Failed to process repo: {e}")
+                    print(f"Failed to process repo: {e}")
 
     results.sort(key=lambda r: r["analysis"].get("relevance_score", 0), reverse=True)
 
+    # Save search history
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -648,10 +328,9 @@ def search():
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Failed to save search history: {e}")
+        print(f"Failed to save search history: {e}")
 
     return jsonify({"results": results})
-
 
 @app.route("/compare", methods=["POST"])
 def compare():
@@ -661,19 +340,6 @@ def compare():
     except json.JSONDecodeError:
         repos = []
     return render_template("compare.html", repos=repos)
-
-
-def csv_safe(value):
-    """Neutralize spreadsheet formula injection. If a cell value starts with
-    =, +, -, @, tab, or CR, Excel/Sheets/LibreOffice may interpret it as a
-    formula when the CSV is opened. Since these values originate from repo
-    descriptions and AI-generated text (both attacker-influenceable), prefix
-    a leading apostrophe to force the cell to be treated as plain text."""
-    s = "" if value is None else str(value)
-    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
-        return "'" + s
-    return s
-
 
 @app.route("/export", methods=["POST"])
 def export():
@@ -687,17 +353,25 @@ def export():
     for repo in results:
         analysis = repo.get("analysis", {})
         writer.writerow([
-            csv_safe(repo.get("full_name", "")), csv_safe(repo.get("url", "")), repo.get("stars", ""),
-            analysis.get("relevance_score", ""), csv_safe(analysis.get("setup_difficulty", "")),
-            csv_safe(", ".join(analysis.get("tech_stack", []) or [])), repo.get("last_updated", ""),
-            csv_safe(analysis.get("match_summary", "")), csv_safe(analysis.get("recommendation", ""))
+            repo.get("full_name", ""),
+            repo.get("url", ""),
+            repo.get("stars", ""),
+            analysis.get("relevance_score", ""),
+            analysis.get("setup_difficulty", ""),
+            ", ".join(analysis.get("tech_stack", []) or []),
+            repo.get("last_updated", ""),
+            analysis.get("match_summary", ""),
+            analysis.get("recommendation", "")
         ])
+
     csv_data = output.getvalue()
     output.close()
 
-    return Response(csv_data, mimetype="text/csv",
-                     headers={"Content-Disposition": "attachment; filename=github_repos_analysis.csv"})
-
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=github_repos_analysis.csv"}
+    )
 
 @app.route("/api/bookmarks", methods=["GET", "POST"])
 def bookmarks():
@@ -715,6 +389,7 @@ def bookmarks():
         conn.close()
         return jsonify(rows)
 
+    # POST
     data = request.get_json(silent=True) or {}
     full_name = data.get("full_name")
     if not full_name:
@@ -725,9 +400,16 @@ def bookmarks():
         cursor.execute(
             """INSERT INTO bookmarks (repo_full_name, stars, relevance_score, summary, tech_stack,
                setup_difficulty, notes, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (full_name, data.get("stars", 0), data.get("relevance_score", 0), data.get("summary", ""),
-             json.dumps(data.get("tech_stack", [])), data.get("setup_difficulty", ""),
-             data.get("notes", ""), data.get("url", ""))
+            (
+                full_name,
+                data.get("stars", 0),
+                data.get("relevance_score", 0),
+                data.get("summary", ""),
+                json.dumps(data.get("tech_stack", [])),
+                data.get("setup_difficulty", ""),
+                data.get("notes", ""),
+                data.get("url", "")
+            )
         )
         conn.commit()
         conn.close()
@@ -736,18 +418,17 @@ def bookmarks():
         conn.close()
         return jsonify({"error": "Repository is already bookmarked."}), 409
 
-
 @app.route("/api/bookmarks/<path:full_name>/notes", methods=["PUT"])
 def update_bookmark_notes(full_name):
     data = request.get_json(silent=True) or {}
     notes = data.get("notes", "")
+
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("UPDATE bookmarks SET notes = ? WHERE repo_full_name = ?", (notes, full_name))
     conn.commit()
     conn.close()
     return jsonify({"status": "updated"})
-
 
 @app.route("/api/bookmarks/<path:full_name>", methods=["DELETE"])
 def delete_bookmark(full_name):
@@ -758,7 +439,6 @@ def delete_bookmark(full_name):
     conn.close()
     return jsonify({"status": "deleted"})
 
-
 @app.route("/api/history", methods=["GET"])
 def history():
     conn = get_db()
@@ -768,28 +448,17 @@ def history():
     conn.close()
     return jsonify(rows)
 
-
-# ==========================================
-# Global error handler: never leak raw exceptions to the client.
-# IMPORTANT: re-raise HTTPException (404, 405, etc.) so Flask/Werkzeug still
-# returns its normal status codes and pages instead of masking every routing
-# error as a 500.
-# ==========================================
-@app.errorhandler(Exception)
-def handle_unexpected_error(e):
-    if isinstance(e, HTTPException):
-        return e
-    logger.error(f"Unhandled exception: {e}")
-    return jsonify({"error": "Something went wrong. Please try again."}), 500
-
-
 # ==========================================
 # Main Execution
 # ==========================================
+
 if __name__ == "__main__":
+    # Local dev only. In production (Render), gunicorn imports the `app` object directly
+    # via the Procfile and never executes this block.
     port = int(os.environ.get("PORT", 5000))
     url = f"http://127.0.0.1:{port}/"
 
+    # Open Brave (or default browser) after Flask boots
     def open_browser():
         try:
             brave_paths = [
