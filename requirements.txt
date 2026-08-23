@@ -1,6 +1,4 @@
-Flask
-gunicorn
-requests
-markdown
-google-generativeai
-bleach
+Flask==3.0.3
+requests==2.32.3
+markdown==3.7
+gunicorn==23.0.0
