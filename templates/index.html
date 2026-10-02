@@ -195,7 +195,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-const SECONDS_PER_REPO = 18; // bumped again: added lightweight issue-title sampling (2 more GitHub calls per repo)
+const SECONDS_PER_REPO = 18; // conservative estimate including one issue-sample call per repo
 const originalTitle = document.title;
 let titleFlashInterval = null;
 
@@ -313,9 +313,10 @@ function renderHeroCard(results) {
   const container = document.getElementById('hero-card-container');
   container.innerHTML = '';
 
-  if (results.length === 0) return;
+  const successfulResults = results.filter(repo => repo.status !== 'failed');
+  if (successfulResults.length === 0) return;
 
-  const top = results[0]; // results are already sorted by relevance_score server-side
+  const top = successfulResults[0]; // successful results are sorted server-side
   const analysis = top.analysis;
   const score = analysis.relevance_score;
 
@@ -366,27 +367,32 @@ function renderResults(results) {
   renderHeroCard(results);
 
   results.forEach((repo, index) => {
-    const score = repo.analysis.relevance_score;
+    const failed = repo.status === 'failed';
+    const analysis = repo.analysis || {};
+    const score = analysis.relevance_score;
     let scoreClass = 'score-low';
-    if (score >= 8) scoreClass = 'score-high';
-    else if (score >= 5) scoreClass = 'score-med';
+    if (!failed && score >= 8) scoreClass = 'score-high';
+    else if (!failed && score >= 5) scoreClass = 'score-med';
 
-    const stackTags = (repo.analysis.tech_stack || [])
+    const stackTags = (analysis.tech_stack || [])
       .map(t => `<span class="tag">${escapeHtml(t)}</span>`)
       .join('');
     const rowLicense = repo.license ? escapeHtml(repo.license) : 'None detected';
     const rowLicenseClass = getLicenseClass(rowLicense);
+    const statusMessage = failed
+      ? `⚠️ ${escapeHtml(repo.error?.message || 'Analysis unavailable.')}`
+      : escapeHtml(repo.description);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><input type="checkbox" class="repo-select" value="${index}" onchange="updateSelectedCount()"></td>
+      <td><input type="checkbox" class="repo-select" value="${index}" onchange="updateSelectedCount()" ${failed ? 'disabled' : ''}></td>
       <td>
         <a href="${escapeHtml(repo.url)}" target="_blank" style="color: var(--primary); font-weight:600; text-decoration:none;">${escapeHtml(repo.full_name)}</a>
-        <div style="font-size:0.8rem; color:var(--text-muted); overflow: hidden; max-width: 300px;">${escapeHtml(repo.description)}</div>
+        <div style="font-size:0.8rem; color:${failed ? 'var(--danger)' : 'var(--text-muted)'}; overflow: hidden; max-width: 300px;">${statusMessage}</div>
       </td>
       <td>★ ${repo.stars.toLocaleString()}<br><span class="tag ${rowLicenseClass}" style="margin-top:4px;">📜 ${rowLicense}</span></td>
-      <td><span class="score-badge ${scoreClass}">${score}/10</span></td>
-      <td>${escapeHtml(repo.analysis.setup_difficulty)}</td>
+      <td><span class="score-badge ${scoreClass}">${failed ? '—' : `${score}/10`}</span></td>
+      <td>${escapeHtml(analysis.setup_difficulty || 'Unavailable')}</td>
       <td>${stackTags}</td>
       <td style="font-size:0.85rem; color:var(--text-muted);">${escapeHtml(repo.last_updated)}</td>
       <td>
@@ -404,6 +410,15 @@ function renderResults(results) {
 
 function openDeepDive(index) {
   const repo = currentResults[index];
+  if (repo.status === 'failed') {
+    document.getElementById('modal-repo-name').innerText = repo.full_name;
+    document.getElementById('modal-body-content').innerHTML = `
+      <div class="con-box"><strong style="color: var(--danger);">Analysis unavailable</strong>
+        <p style="margin-top: 8px;">${escapeHtml(repo.error?.message || 'Repository analysis failed.')}</p>
+      </div>`;
+    document.getElementById('deep-dive-modal').style.display = 'flex';
+    return;
+  }
   document.getElementById('modal-repo-name').innerText = repo.full_name; // innerText is safe, no escaping needed
   const analysis = repo.analysis;
 
@@ -445,7 +460,7 @@ function openDeepDive(index) {
     <div style="display:flex; gap:16px; margin-bottom:16px; font-size:0.85rem; color: var(--text-muted); flex-wrap: wrap; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 10px 0;">
       <div>📜 License: <span class="tag ${getLicenseClass(license)}" style="margin:0;">${license}</span></div>
       <div>👤 Contributors: <strong style="color:var(--text);">${contributors}</strong></div>
-      <div>⚠️ Open Issues: <strong style="color:var(--text);">${openIssues}</strong></div>
+      <div>⚠️ Open Issues/PRs: <strong style="color:var(--text);">${openIssues}</strong></div>
       <div>🏷️ Latest Release: <strong style="color:var(--text);">${latestRelease}</strong></div>
     </div>
     ${depFiles ? `<div style="margin-bottom:16px; font-size:0.85rem;"><span style="color:var(--text-muted);">📦 Dependency files found: </span>${depFiles}</div>` : ''}
@@ -509,6 +524,7 @@ async function exportResults() {
 
 async function bookmarkRepo(index) {
   const repo = currentResults[index];
+  if (repo.status === 'failed') return;
   const notes = prompt("Add personal note for this bookmark (optional):", "");
   const payload = {
     full_name: repo.full_name,
