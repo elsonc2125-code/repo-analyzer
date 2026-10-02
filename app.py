@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import io
 import csv
+import hmac
 import logging
 import webbrowser
 from threading import Timer
@@ -120,6 +121,43 @@ def init_db():
     conn.close()
 
 init_db()
+
+
+def authentication_required():
+    return Response(
+        "Authentication required.\n",
+        status=401,
+        mimetype="text/plain",
+        headers={"WWW-Authenticate": 'Basic realm="Repo Analyzer", charset="UTF-8"'},
+    )
+
+
+def constant_time_credentials_match(provided, expected):
+    if not isinstance(provided, str) or not isinstance(expected, str):
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+@app.before_request
+def require_basic_authentication():
+    expected_username = os.getenv("REPO_ANALYZER_USERNAME")
+    expected_password = os.getenv("REPO_ANALYZER_PASSWORD")
+    if not expected_username or not expected_password:
+        return authentication_required()
+
+    credentials = request.authorization
+    auth_type = getattr(credentials, "type", None)
+    if credentials is None or not isinstance(auth_type, str) or auth_type.lower() != "basic":
+        return authentication_required()
+
+    username_matches = constant_time_credentials_match(
+        credentials.username, expected_username
+    )
+    password_matches = constant_time_credentials_match(
+        credentials.password, expected_password
+    )
+    if not (username_matches and password_matches):
+        return authentication_required()
 
 # ==========================================
 # Helper Functions

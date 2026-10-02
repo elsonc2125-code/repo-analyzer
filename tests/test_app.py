@@ -10,6 +10,10 @@ import requests
 import app
 
 
+TEST_AUTH_USERNAME = "repo-analyzer-test-user"
+TEST_AUTH_PASSWORD = "repo-analyzer-test-password"
+
+
 class FakeResponse:
     def __init__(self, status_code=200, payload=None, headers=None):
         self.status_code = status_code
@@ -27,11 +31,24 @@ class FakeResponse:
             raise requests.HTTPError(response=self)
 
 
+def basic_auth_header(username=TEST_AUTH_USERNAME, password=TEST_AUTH_PASSWORD):
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
 @pytest.fixture()
-def client():
+def raw_client(monkeypatch):
+    monkeypatch.setenv("REPO_ANALYZER_USERNAME", TEST_AUTH_USERNAME)
+    monkeypatch.setenv("REPO_ANALYZER_PASSWORD", TEST_AUTH_PASSWORD)
     app.app.config.update(TESTING=True)
     with app.app.test_client() as test_client:
         yield test_client
+
+
+@pytest.fixture()
+def client(raw_client):
+    raw_client.environ_base["HTTP_AUTHORIZATION"] = basic_auth_header()["Authorization"]
+    return raw_client
 
 
 def repo_item(name):
@@ -95,6 +112,138 @@ def gemini_synthesis_response(result=None):
             "text": json.dumps(result or valid_synthesis_result())
         }]}}]
     })
+
+
+def protected_route_cases():
+    adapter = app.app.url_map.bind("localhost")
+    cases = []
+    for rule in app.app.url_map.iter_rules():
+        values = {
+            argument: "owner/repo" if argument == "full_name" else "app.css"
+            for argument in rule.arguments
+        }
+        path = adapter.build(rule.endpoint, values)
+        for method in sorted(rule.methods):
+            cases.append(pytest.param(method, path, id=f"{method}-{rule.rule}"))
+    return cases
+
+
+def test_basic_auth_requires_authorization_header(raw_client):
+    response = raw_client.get("/")
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == (
+        'Basic realm="Repo Analyzer", charset="UTF-8"'
+    )
+
+
+def test_basic_auth_rejects_malformed_authorization(raw_client):
+    response = raw_client.get("/", headers={"Authorization": "Basic not-valid-base64!"})
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        basic_auth_header(username="wrong-user"),
+        basic_auth_header(password="wrong-password"),
+    ],
+    ids=["wrong-username", "wrong-password"],
+)
+def test_basic_auth_rejects_incorrect_credentials(raw_client, credentials):
+    response = raw_client.get("/", headers=credentials)
+
+    assert response.status_code == 401
+
+
+def test_basic_auth_allows_normal_route_behavior(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"Repo Analyzer" in response.data
+
+
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [
+        (None, None),
+        (TEST_AUTH_USERNAME, None),
+        (None, TEST_AUTH_PASSWORD),
+        ("", TEST_AUTH_PASSWORD),
+        (TEST_AUTH_USERNAME, ""),
+        ("", ""),
+    ],
+)
+def test_basic_auth_fails_closed_when_server_credentials_are_incomplete(
+    raw_client, monkeypatch, username, password
+):
+    for variable, value in (
+        ("REPO_ANALYZER_USERNAME", username),
+        ("REPO_ANALYZER_PASSWORD", password),
+    ):
+        if value is None:
+            monkeypatch.delenv(variable, raising=False)
+        else:
+            monkeypatch.setenv(variable, value)
+
+    response = raw_client.get("/", headers=basic_auth_header())
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"].startswith("Basic ")
+
+
+@pytest.mark.parametrize(("method", "path"), protected_route_cases())
+def test_basic_auth_protects_every_route_and_method(raw_client, method, path):
+    response = raw_client.open(path, method=method)
+
+    assert response.status_code == 401
+
+
+def test_unauthenticated_search_makes_no_upstream_calls(raw_client, monkeypatch):
+    def fail_upstream_call(*args, **kwargs):
+        raise AssertionError("unauthenticated search reached an upstream service")
+
+    monkeypatch.setattr(app.requests, "get", fail_upstream_call)
+    monkeypatch.setattr(app.requests, "post", fail_upstream_call)
+
+    response = raw_client.post("/search", data={"query": "flask"})
+
+    assert response.status_code == 401
+
+
+def test_unauthenticated_synthesis_makes_no_gemini_call(raw_client, monkeypatch):
+    def fail_gemini_call(*args, **kwargs):
+        raise AssertionError("unauthenticated synthesis reached Gemini")
+
+    monkeypatch.setattr(app.requests, "post", fail_gemini_call)
+    response = raw_client.post("/api/synthesize", json={
+        "goal": "Choose a repository",
+        "results": [
+            successful_analysis_result("owner/one"),
+            successful_analysis_result("owner/two"),
+        ],
+    })
+
+    assert response.status_code == 401
+
+
+def test_unauthenticated_bookmark_mutations_do_not_access_database(
+    raw_client, monkeypatch
+):
+    def fail_database_access():
+        raise AssertionError("unauthenticated bookmark request accessed the database")
+
+    monkeypatch.setattr(app, "get_db", fail_database_access)
+    responses = [
+        raw_client.post("/api/bookmarks", json={"full_name": "owner/repo"}),
+        raw_client.put(
+            "/api/bookmarks/owner/repo/notes", json={"notes": "unauthorized change"}
+        ),
+        raw_client.delete("/api/bookmarks/owner/repo"),
+    ]
+
+    assert [response.status_code for response in responses] == [401, 401, 401]
 
 
 def test_readme_html_removes_active_content_and_dangerous_links():
