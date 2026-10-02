@@ -78,6 +78,51 @@ SYNTHESIS_PROMPT_VERSION = "2026-10-02-batch-v1"
 MAX_SYNTHESIS_REPOS = 10
 MAX_SYNTHESIS_INPUT_CHARS = 12000
 MAX_SYNTHESIS_OUTPUT_TOKENS = 1200
+MAX_GEMINI_ERROR_LOG_CHARS = 1000
+
+
+def sanitized_gemini_error_message(response, api_key):
+    """Extract a bounded provider message without exposing request credentials."""
+    message = ""
+    if response is not None:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                message = error["message"]
+            elif isinstance(error, str):
+                message = error
+            elif isinstance(payload.get("message"), str):
+                message = payload["message"]
+        if not message:
+            try:
+                body = response.text
+            except Exception:
+                body = ""
+            if isinstance(body, str):
+                message = body
+
+    if isinstance(api_key, str) and api_key:
+        message = message.replace(api_key, "[REDACTED]")
+    message = " ".join(message.split())
+    return message[:MAX_GEMINI_ERROR_LOG_CHARS] or "<no provider error body>"
+
+
+def log_gemini_http_error(operation, error):
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    provider_message = sanitized_gemini_error_message(
+        response, os.getenv("GEMINI_API_KEY", "")
+    )
+    logger.warning(
+        "Gemini HTTP error during %s: status=%s provider_message=%s",
+        operation,
+        status,
+        provider_message,
+    )
 
 # ==========================================
 # Database Setup
@@ -576,7 +621,7 @@ Respond ONLY with valid JSON in this exact structure:
             code, message = "ai_unavailable", "The AI service is temporarily unavailable."
         else:
             code, message = "ai_request_error", "AI analysis request failed."
-        logger.warning("Gemini request failed for %s (%s)", repo_name, type(exc).__name__)
+        log_gemini_http_error("repository analysis", exc)
         raise RepositoryAnalysisError(code, message) from exc
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         logger.warning("Gemini returned invalid analysis for %s", repo_name)
@@ -799,6 +844,7 @@ Respond ONLY with JSON:
                 code, message = "ai_unavailable", "The AI service is temporarily unavailable."
             else:
                 code, message = "ai_request_error", "AI synthesis request failed."
+            log_gemini_http_error("synthesis", exc)
             raise RepositoryAnalysisError(code, message) from exc
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RepositoryAnalysisError("ai_invalid_response", "AI returned an invalid synthesis.") from exc

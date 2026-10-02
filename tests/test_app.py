@@ -2,6 +2,7 @@ import base64
 import csv
 import io
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,11 +16,11 @@ TEST_AUTH_PASSWORD = "repo-analyzer-test-password"
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None, headers=None):
+    def __init__(self, status_code=200, payload=None, headers=None, text="upstream response"):
         self.status_code = status_code
         self.payload = payload
         self.headers = headers or {}
-        self.text = "upstream response"
+        self.text = text
 
     def json(self):
         if isinstance(self.payload, Exception):
@@ -617,6 +618,37 @@ def test_ai_http_failures_are_structured_and_not_cached(monkeypatch, status, cod
     assert app._analysis_cache == {}
 
 
+def test_ai_http_error_logs_provider_message_without_api_key(monkeypatch, caplog):
+    app._analysis_cache.clear()
+    api_key = "diagnostic-test-api-key"
+    monkeypatch.setenv("GEMINI_API_KEY", api_key)
+    monkeypatch.setattr(
+        app.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(
+            status_code=403,
+            payload={"error": {"message": f"API key {api_key} was rejected"}},
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=app.__name__):
+        with pytest.raises(app.RepositoryAnalysisError) as error:
+            app.analyze_with_llm(
+                "owner/repo",
+                "description",
+                "prompt-content-must-not-be-logged",
+                "goal",
+                "query",
+            )
+
+    assert error.value.code == "ai_auth_error"
+    assert error.value.message == "AI analysis credentials were rejected."
+    assert "status=403" in caplog.text
+    assert "API key [REDACTED] was rejected" in caplog.text
+    assert api_key not in caplog.text
+    assert "prompt-content-must-not-be-logged" not in caplog.text
+
+
 def test_ai_malformed_output_is_not_cached(monkeypatch):
     app._analysis_cache.clear()
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
@@ -894,6 +926,36 @@ def test_synthesis_endpoint_maps_gemini_http_failures(
     assert response.status_code == expected_status
     assert set(response.get_json()) == {"error", "code"}
     assert response.get_json()["code"] == expected_code
+
+
+def test_synthesis_http_error_logs_sanitized_response_body(monkeypatch, caplog):
+    app._synthesis_cache.clear()
+    api_key = "synthesis-diagnostic-test-api-key"
+    monkeypatch.setenv("GEMINI_API_KEY", api_key)
+    monkeypatch.setattr(
+        app.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(
+            status_code=403,
+            payload=ValueError("not json"),
+            text=f"Google rejected credential {api_key}",
+        ),
+    )
+    results = [
+        successful_analysis_result("owner/one"),
+        successful_analysis_result("owner/two"),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger=app.__name__):
+        with pytest.raises(app.RepositoryAnalysisError) as error:
+            app.synthesize_batch_with_llm(results, "synthesis-goal-must-not-be-logged")
+
+    assert error.value.code == "ai_auth_error"
+    assert error.value.message == "AI synthesis credentials were rejected."
+    assert "status=403" in caplog.text
+    assert "Google rejected credential [REDACTED]" in caplog.text
+    assert api_key not in caplog.text
+    assert "synthesis-goal-must-not-be-logged" not in caplog.text
 
 
 @pytest.mark.parametrize(
