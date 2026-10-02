@@ -563,6 +563,11 @@ def test_ai_cache_includes_query_and_evidence_and_validates_response(monkeypatch
     assert again["pros"] == []
     assert len(calls) == 3
     assert calls[0]["timeout"] == app.GEMINI_TIMEOUT
+    assert calls[0]["headers"] == {
+        "Content-Type": "application/json",
+        "x-goog-api-key": "test-key",
+    }
+    assert "params" not in calls[0]
     assert calls[0]["json"]["generationConfig"]["responseMimeType"] == "application/json"
 
 
@@ -754,6 +759,11 @@ def test_batch_synthesis_is_bounded_traceable_and_cached(monkeypatch):
     assert second["synthesis"]["summary"] == "R1 is the stronger fit."
     assert [source["repository_id"] for source in second["sources"]] == ["R1", "R2"]
     assert len(calls) == 1
+    assert calls[0]["headers"] == {
+        "Content-Type": "application/json",
+        "x-goog-api-key": "test-key",
+    }
+    assert "params" not in calls[0]
     generation_config = calls[0]["json"]["generationConfig"]
     assert generation_config["maxOutputTokens"] == app.MAX_SYNTHESIS_OUTPUT_TOKENS
     assert generation_config["responseMimeType"] == "application/json"
